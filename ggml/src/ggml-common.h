@@ -459,6 +459,57 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// MS_C: bit-shift trellis with a computed value per state, k = 1..6 bits per weight
+// state: s_0 = s0, s_i = ((s_{i-1} << k) | b_i) & GGML_MS_STATE_MASK, b_i = next k bits of qs (MSB first)
+// value: x = GGML_MS_C_A*s + GGML_MS_C_B (mod 2^32), w = ((sum of the 4 bytes of x) - 510) * d
+#define QK_MS 512
+#define GGML_MS_L 14
+#define GGML_MS_STATE_MASK ((1u << GGML_MS_L) - 1u)
+#define GGML_MS_C_A 34038481u
+#define GGML_MS_C_B 76625530u
+
+typedef struct {
+    ggml_half d;            // scale
+    uint16_t  s0;           // state of the first weight
+    uint8_t   qs[QK_MS/8];  // 511 symbols + k zero pad bits
+} block_ms_c1;
+static_assert(sizeof(block_ms_c1) == sizeof(ggml_half) + sizeof(uint16_t) + QK_MS/8, "wrong ms_c1 block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  s0;
+    uint8_t   qs[QK_MS/4];
+} block_ms_c2;
+static_assert(sizeof(block_ms_c2) == sizeof(ggml_half) + sizeof(uint16_t) + QK_MS/4, "wrong ms_c2 block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  s0;
+    uint8_t   qs[3*QK_MS/8];
+} block_ms_c3;
+static_assert(sizeof(block_ms_c3) == sizeof(ggml_half) + sizeof(uint16_t) + 3*QK_MS/8, "wrong ms_c3 block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  s0;
+    uint8_t   qs[QK_MS/2];
+} block_ms_c4;
+static_assert(sizeof(block_ms_c4) == sizeof(ggml_half) + sizeof(uint16_t) + QK_MS/2, "wrong ms_c4 block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  s0;
+    uint8_t   qs[5*QK_MS/8];
+} block_ms_c5;
+static_assert(sizeof(block_ms_c5) == sizeof(ggml_half) + sizeof(uint16_t) + 5*QK_MS/8, "wrong ms_c5 block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  s0;
+    uint8_t   qs[3*QK_MS/4];
+} block_ms_c6;
+static_assert(sizeof(block_ms_c6) == sizeof(ggml_half) + sizeof(uint16_t) + 3*QK_MS/4, "wrong ms_c6 block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 

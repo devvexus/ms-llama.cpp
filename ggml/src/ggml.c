@@ -951,6 +951,48 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_MS_C1] = {
+        .type_name                = "ms_c1",
+        .blck_size                = QK_MS,
+        .type_size                = sizeof(block_ms_c1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ms_c1,
+    },
+    [GGML_TYPE_MS_C2] = {
+        .type_name                = "ms_c2",
+        .blck_size                = QK_MS,
+        .type_size                = sizeof(block_ms_c2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ms_c2,
+    },
+    [GGML_TYPE_MS_C3] = {
+        .type_name                = "ms_c3",
+        .blck_size                = QK_MS,
+        .type_size                = sizeof(block_ms_c3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ms_c3,
+    },
+    [GGML_TYPE_MS_C4] = {
+        .type_name                = "ms_c4",
+        .blck_size                = QK_MS,
+        .type_size                = sizeof(block_ms_c4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ms_c4,
+    },
+    [GGML_TYPE_MS_C5] = {
+        .type_name                = "ms_c5",
+        .blck_size                = QK_MS,
+        .type_size                = sizeof(block_ms_c5),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ms_c5,
+    },
+    [GGML_TYPE_MS_C6] = {
+        .type_name                = "ms_c6",
+        .blck_size                = QK_MS,
+        .type_size                = sizeof(block_ms_c6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ms_c6,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

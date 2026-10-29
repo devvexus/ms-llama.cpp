@@ -2761,6 +2761,74 @@ void dequantize_row_iq4_xs(const block_iq4_xs * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// ====================== MS_C bit-shift trellis
+
+static inline int ms_c_value(uint32_t s) {
+    const uint32_t x = GGML_MS_C_A * s + GGML_MS_C_B;
+    return (int) ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)) - 510;
+}
+
+static inline void dequantize_block_ms_c(const uint8_t * GGML_RESTRICT qs, uint16_t s0, float d, int bits, float * GGML_RESTRICT y) {
+    const uint32_t mask = (1u << bits) - 1;
+
+    uint32_t s = s0 & GGML_MS_STATE_MASK;
+    uint32_t acc = 0;
+    int nbits = 0;
+
+    y[0] = (float) ms_c_value(s) * d;
+    for (int i = 1; i < QK_MS; ++i) {
+        if (nbits < bits) {
+            acc = (acc << 8) | *qs++;
+            nbits += 8;
+        }
+        nbits -= bits;
+        s = ((s << bits) | ((acc >> nbits) & mask)) & GGML_MS_STATE_MASK;
+        y[i] = (float) ms_c_value(s) * d;
+    }
+}
+
+void dequantize_row_ms_c1(const block_ms_c1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MS == 0);
+    for (int64_t i = 0; i < k / QK_MS; i++) {
+        dequantize_block_ms_c(x[i].qs, x[i].s0, GGML_FP16_TO_FP32(x[i].d), 1, y + i*QK_MS);
+    }
+}
+
+void dequantize_row_ms_c2(const block_ms_c2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MS == 0);
+    for (int64_t i = 0; i < k / QK_MS; i++) {
+        dequantize_block_ms_c(x[i].qs, x[i].s0, GGML_FP16_TO_FP32(x[i].d), 2, y + i*QK_MS);
+    }
+}
+
+void dequantize_row_ms_c3(const block_ms_c3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MS == 0);
+    for (int64_t i = 0; i < k / QK_MS; i++) {
+        dequantize_block_ms_c(x[i].qs, x[i].s0, GGML_FP16_TO_FP32(x[i].d), 3, y + i*QK_MS);
+    }
+}
+
+void dequantize_row_ms_c4(const block_ms_c4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MS == 0);
+    for (int64_t i = 0; i < k / QK_MS; i++) {
+        dequantize_block_ms_c(x[i].qs, x[i].s0, GGML_FP16_TO_FP32(x[i].d), 4, y + i*QK_MS);
+    }
+}
+
+void dequantize_row_ms_c5(const block_ms_c5 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MS == 0);
+    for (int64_t i = 0; i < k / QK_MS; i++) {
+        dequantize_block_ms_c(x[i].qs, x[i].s0, GGML_FP16_TO_FP32(x[i].d), 5, y + i*QK_MS);
+    }
+}
+
+void dequantize_row_ms_c6(const block_ms_c6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MS == 0);
+    for (int64_t i = 0; i < k / QK_MS; i++) {
+        dequantize_block_ms_c(x[i].qs, x[i].s0, GGML_FP16_TO_FP32(x[i].d), 6, y + i*QK_MS);
+    }
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int64_t k) {
@@ -5618,6 +5686,30 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ4_NL:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+            } break;
+        case GGML_TYPE_MS_C1:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ms_c1, data, nb);
+            } break;
+        case GGML_TYPE_MS_C2:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ms_c2, data, nb);
+            } break;
+        case GGML_TYPE_MS_C3:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ms_c3, data, nb);
+            } break;
+        case GGML_TYPE_MS_C4:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ms_c4, data, nb);
+            } break;
+        case GGML_TYPE_MS_C5:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ms_c5, data, nb);
+            } break;
+        case GGML_TYPE_MS_C6:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ms_c6, data, nb);
             } break;
 
         case GGML_TYPE_I8:

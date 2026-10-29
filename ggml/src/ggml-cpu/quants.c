@@ -5,6 +5,7 @@
 #include "simd-mappings.h"
 #include "ggml-quants.h"
 #include "quants.h"
+#include "vec.h"
 
 #include "arch-fallback.h"
 
@@ -1336,4 +1337,79 @@ void quantize_row_iq4_nl(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
+}
+
+// ============================ MS_C bit-shift trellis
+
+// decode one block to F32, then F32 dot product
+static void ggml_vec_dot_ms_c_f32(ggml_to_float_t to_float, size_t type_size, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const float * GGML_RESTRICT y) {
+    assert(n % QK_MS == 0);
+
+    const char * x = (const char *) vx;
+
+    float tmp[QK_MS];
+    float sumf = 0.0f;
+
+    for (int i = 0; i < n / QK_MS; i++) {
+        float sumb;
+        to_float(x + i*type_size, tmp, QK_MS);
+        ggml_vec_dot_f32(QK_MS, &sumb, 0, tmp, 0, y + i*QK_MS, 0, 1);
+        sumf += sumb;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_ms_c1_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_ms_c_f32((ggml_to_float_t) dequantize_row_ms_c1, sizeof(block_ms_c1), n, s, vx, vy);
+}
+
+void ggml_vec_dot_ms_c2_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_ms_c_f32((ggml_to_float_t) dequantize_row_ms_c2, sizeof(block_ms_c2), n, s, vx, vy);
+}
+
+void ggml_vec_dot_ms_c3_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_ms_c_f32((ggml_to_float_t) dequantize_row_ms_c3, sizeof(block_ms_c3), n, s, vx, vy);
+}
+
+void ggml_vec_dot_ms_c4_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_ms_c_f32((ggml_to_float_t) dequantize_row_ms_c4, sizeof(block_ms_c4), n, s, vx, vy);
+}
+
+void ggml_vec_dot_ms_c5_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_ms_c_f32((ggml_to_float_t) dequantize_row_ms_c5, sizeof(block_ms_c5), n, s, vx, vy);
+}
+
+void ggml_vec_dot_ms_c6_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_ms_c_f32((ggml_to_float_t) dequantize_row_ms_c6, sizeof(block_ms_c6), n, s, vx, vy);
 }
