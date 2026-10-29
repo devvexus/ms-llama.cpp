@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -951,9 +952,9 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
-    // Hadamard-transformed activations, keyed by (input, rotation): folded weights that read the same activation share one transform
-    ggml_tensor * get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot) const;
-    void          set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, ggml_tensor * res);
+    // Hadamard-transformed activations, keyed by (input, rotation, signs): folded weights that read the same activation share one transform
+    ggml_tensor * get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, const ggml_tensor * signs) const;
+    void          set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, const ggml_tensor * signs, ggml_tensor * res);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
@@ -977,7 +978,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
-    std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
+    std::map<std::tuple<const ggml_tensor *, const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 
     ggml_context_ptr ctx_compute;
 
