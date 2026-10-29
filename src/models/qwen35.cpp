@@ -37,11 +37,45 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a split token embedding holds the first n_hi stored rows in token_embd and the other rows in token_embd_lo
+    int64_t n_vocab_hi = n_vocab;
+    if (const auto * w_lo = ml.get_weight(tn(LLM_TENSOR_TOKEN_EMBD_LO, "weight").str().c_str())) {
+        const int64_t n_lo = w_lo->tensor->ne[1];
+        if (n_lo <= 0 || n_lo >= n_vocab) {
+            throw std::runtime_error("token_embd_lo.weight: bad number of rows");
+        }
+        if (hparams.n_layer_nextn > 0 && !(mtp_flags & (TENSOR_SKIP | TENSOR_NOT_REQUIRED))) {
+            throw std::runtime_error("a split token embedding does not support the MTP block");
+        }
+        std::vector<int32_t> order;
+        ml.get_arr(LLM_KV_MSFFN_EMB_SPLIT_ORDER, order);
+        if ((int64_t) order.size() != n_vocab) {
+            throw std::runtime_error("msffn.emb_split_order needs one entry per token");
+        }
+        std::vector<bool> seen(n_vocab, false);
+        for (const int32_t id : order) {
+            if (id < 0 || id >= n_vocab || seen[id]) {
+                throw std::runtime_error("msffn.emb_split_order is not a permutation of the vocabulary");
+            }
+            seen[id] = true;
+        }
+        n_vocab_hi = n_vocab - n_lo;
+        emb_split.n_hi  = n_vocab_hi;
+        emb_split.n_lo  = n_lo;
+        emb_split.order = std::move(order);
+    }
+
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_hi }, 0);
+    if (emb_split.n_hi) {
+        emb_split.tok_lo = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_LO, "weight"), { n_embd, emb_split.n_lo }, 0);
+    }
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    if (emb_split.n_hi && output) {
+        throw std::runtime_error("a split token embedding needs a tied output");
+    }
 
     // optional projection of the embeddings output
     cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
@@ -49,7 +83,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_hi }, TENSOR_DUPLICATED);
+        if (emb_split.n_hi) {
+            emb_split.out_lo = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_LO, "weight"), { n_embd, emb_split.n_lo }, TENSOR_DUPLICATED);
+        }
     }
 
     auto load_block_trunk = [&](int il, int flags) {
@@ -146,7 +183,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = build_inp_embd(model.tok_embd, 1.0f, &model.emb_split);
 
     cb(inpL, "model.input_embed", -1);
 
@@ -230,7 +267,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (model.emb_split.n_hi) {
+        cur = build_split_head(model.output, model.emb_split, cur);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

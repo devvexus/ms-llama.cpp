@@ -22,6 +22,7 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_emb_split;
 
 class llama_moe_cache;
 
@@ -1113,6 +1114,9 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // output head of a split token embedding (w holds the high rows): logits of both tables, in token order
+    ggml_tensor * build_split_head(ggml_tensor * w, const llama_emb_split & split, ggml_tensor * cur) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
@@ -1240,7 +1244,8 @@ struct llm_graph_context {
     //
 
     // tok_scale: applied to token rows only
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+    // split: tok_embd holds only the high rows of a split table, see llama_emb_split
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f, const llama_emb_split * split = nullptr) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

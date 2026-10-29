@@ -2038,6 +2038,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        // the graph of the memory-fit pass reads the index tensors
+        load_tensors_emb_split();
         return true;
     }
 
@@ -2063,6 +2065,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_emb_split();
 
     return true;
 }
@@ -2451,6 +2454,109 @@ void llama_model_base::load_tensors_hadamard() {
 
     LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
+}
+
+// the lookup tables go on the buffer type of token_embd, the logit permutation on the buffer type of the output
+void llama_model_base::load_tensors_emb_split() {
+    auto & es = emb_split;
+    if (es.n_hi == 0) {
+        return;
+    }
+    if (!tok_embd || !output || !es.tok_lo || !es.out_lo || !tok_embd->buffer || !output->buffer) {
+        throw std::runtime_error("split token embedding: tensors are not loaded");
+    }
+    const int64_t n_vocab = es.n_hi + es.n_lo;
+    if ((int64_t) es.order.size() != n_vocab) {
+        throw std::runtime_error("split token embedding: bad order length");
+    }
+
+    // both output tables read the same transformed input
+    if (const auto it = hdmd.rot.find(output); it != hdmd.rot.end()) {
+        hdmd.rot.emplace(es.out_lo, it->second);
+    }
+
+    std::vector<int32_t> inv(n_vocab);
+    for (int64_t i = 0; i < n_vocab; ++i) {
+        inv[es.order[i]] = (int32_t) i;
+    }
+    std::vector<int32_t> hidx(n_vocab), lidx(n_vocab);
+    std::vector<float>   hmask(n_vocab), lmask(n_vocab);
+    for (int64_t t = 0; t < n_vocab; ++t) {
+        const bool hi = inv[t] < es.n_hi;
+        hidx[t]  = hi ? inv[t] : 0;
+        lidx[t]  = hi ? 0 : (int32_t) (inv[t] - es.n_hi);
+        hmask[t] = hi ? 1.0f : 0.0f;
+        lmask[t] = hi ? 0.0f : 1.0f;
+    }
+
+    struct index_tensor {
+        ggml_tensor ** dst;
+        const char *   name;
+        ggml_type      type;
+        const void *   data;
+    };
+
+    auto make = [&](const ggml_tensor * w, std::initializer_list<index_tensor> specs) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w->buffer);
+        // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
+        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                buft = ggml_backend_dev_buffer_type(dev);
+            }
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * specs.size(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (!ctx) {
+            throw std::runtime_error("failed to create split embedding context");
+        }
+        for (const auto & s : specs) {
+            *s.dst = ggml_new_tensor_2d(ctx.get(), s.type, 1, n_vocab);
+            ggml_set_name(*s.dst, s.name);
+        }
+
+        ggml_backend_buffer_ptr buffer;
+        if (no_alloc()) {
+            buffer.reset(ggml_backend_buft_alloc_buffer(buft, 0)); // dummy buffer, as for the weights
+            for (const auto & s : specs) {
+                (*s.dst)->buffer = buffer.get();
+            }
+        } else {
+            buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        }
+        if (!buffer) {
+            throw std::runtime_error(format("unable to allocate %s split embedding buffer", ggml_backend_buft_name(buft)));
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        if (!no_alloc()) {
+            for (const auto & s : specs) {
+                ggml_backend_tensor_set(*s.dst, s.data, 0, ggml_nbytes(*s.dst));
+            }
+        }
+
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        buffers.emplace_back(std::move(buffer));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+    };
+
+    make(tok_embd, {
+        { &es.in_hidx,  "emb_split.hidx",  GGML_TYPE_I32, hidx.data()  },
+        { &es.in_lidx,  "emb_split.lidx",  GGML_TYPE_I32, lidx.data()  },
+        { &es.in_hmask, "emb_split.hmask", GGML_TYPE_F32, hmask.data() },
+        { &es.in_lmask, "emb_split.lmask", GGML_TYPE_F32, lmask.data() },
+    });
+    make(output, {
+        { &es.out_inv, "emb_split.inv",   GGML_TYPE_I32, inv.data()      },
+        { &es.out_ord, "emb_split.order", GGML_TYPE_I32, es.order.data() },
+    });
+
+    LLAMA_LOG_INFO("%s: split token embedding: %lld + %lld rows (%s + %s)\n", __func__,
+            (long long) es.n_hi, (long long) es.n_lo, ggml_type_name(tok_embd->type), ggml_type_name(es.tok_lo->type));
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

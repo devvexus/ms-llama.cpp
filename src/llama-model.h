@@ -717,6 +717,28 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
+// token embedding stored as two tables: the first n_hi stored rows in token_embd, the other rows in token_embd_lo
+// stored row i is the token order[i]; the index tensors are made in load_tensors_emb_split
+struct llama_emb_split {
+    int64_t n_hi = 0; // 0 if the table is not split
+    int64_t n_lo = 0;
+
+    std::vector<int32_t> order;
+
+    ggml_tensor * tok_lo = nullptr; // token_embd_lo for the lookup
+    ggml_tensor * out_lo = nullptr; // token_embd_lo for the output head
+
+    // per token: row in each table (0 in the table that does not hold it) and a 1/0 mask
+    ggml_tensor * in_hidx  = nullptr;
+    ggml_tensor * in_lidx  = nullptr;
+    ggml_tensor * in_hmask = nullptr;
+    ggml_tensor * in_lmask = nullptr;
+
+    // on the output buffer: stored row of each token, and the order
+    ggml_tensor * out_inv = nullptr;
+    ggml_tensor * out_ord = nullptr;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -730,6 +752,8 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+
+    llama_emb_split emb_split;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
@@ -982,6 +1006,9 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: make the index tensors of a split token embedding, the low output table gets the transform of the high one
+    void load_tensors_emb_split();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

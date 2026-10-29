@@ -493,6 +493,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_PRISM_HADAMARD_INVERSE_BLOCK_SIZES,  "prism.hadamard.inverse_block_sizes"  },
     { LLM_KV_PRISM_HADAMARD_INVERSE_SIGN_IDS,     "prism.hadamard.inverse_sign_ids"     },
 
+    { LLM_KV_MSFFN_EMB_SPLIT_ORDER, "msffn.emb_split_order" },
+
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
     { LLM_KV_TOKENIZER_SUFFIX_ID, "tokenizer.ggml.suffix_token_id" },
@@ -501,6 +503,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
 static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_TOKEN_EMBD,                             "token_embd" },
+    { LLM_TENSOR_TOKEN_EMBD_LO,                          "token_embd_lo" },
     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
     { LLM_TENSOR_OUTPUT,                                 "output" },
@@ -840,6 +843,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
 //
 static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_TOKEN_EMBD_LO,              {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_HRM_Z_L_INIT,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},

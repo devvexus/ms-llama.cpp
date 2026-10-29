@@ -63,9 +63,18 @@ static void llama_verify_hadamard_graph(
         }
 
         if (node->op == GGML_OP_MUL_MAT && ((const int32_t *) node->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD) {
-            const auto lk = lookups.find(unwrap(node->src[1]));
-            if (lk != lookups.end()) {
-                lk->second = true;
+            // a split table adds masked lookups before the transform, so follow ADD and MUL back to the lookups
+            std::vector<const ggml_tensor *> todo = { unwrap(node->src[1]) };
+            while (!todo.empty()) {
+                const ggml_tensor * t = todo.back();
+                todo.pop_back();
+                const auto lk = lookups.find(t);
+                if (lk != lookups.end()) {
+                    lk->second = true;
+                } else if (t && (t->op == GGML_OP_ADD || t->op == GGML_OP_MUL)) {
+                    todo.push_back(unwrap(t->src[0]));
+                    todo.push_back(unwrap(t->src[1]));
+                }
             }
             continue;
         }

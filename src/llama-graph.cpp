@@ -1680,6 +1680,30 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_split_head(ggml_tensor * w, const llama_emb_split & split, ggml_tensor * cur) const {
+    // both tables have the same transform, so build_hadamard_input makes the transformed input once
+    ggml_tensor * hi = build_lora_mm(w, cur);
+    ggml_tensor * lo = build_lora_mm(split.out_lo, cur);
+
+    // logits in stored row order
+    ggml_tensor * st = ggml_concat(ctx0, hi, lo, 0);
+    cb(st, "result_output_stored", -1);
+
+    if (st->ne[1] == 1) {
+        // one output: write stored row i to row order[i] of a copy, the permutation writes every row
+        ggml_tensor * dst = ggml_reshape_2d(ctx0, ggml_dup(ctx0, st), 1, st->ne[0]);
+        ggml_tensor * src = ggml_reshape_2d(ctx0, st, 1, st->ne[0]);
+        ggml_tensor * ord = ggml_reshape_1d(ctx0, split.out_ord, split.out_ord->ne[1]);
+        // the logits must not be a view, ggml-alloc can free the source of a view that is an output
+        return ggml_cont_2d(ctx0, ggml_set_rows(ctx0, dst, src, ord), st->ne[0], 1);
+    }
+
+    // row t of the gather is stored row inv[t]
+    ggml_tensor * inv = ggml_reshape_1d(ctx0, split.out_inv, split.out_inv->ne[1]);
+    ggml_tensor * out = ggml_get_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, st)), inv);
+    return ggml_cont(ctx0, ggml_transpose(ctx0, out));
+}
+
 llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
           ggml_tensor * cur) const {
     llm_graph_amax_src1 result = {
@@ -2643,7 +2667,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 }
 
 // input embeddings with optional lora
-ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
+ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale, const llama_emb_split * split) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
 
@@ -2683,17 +2707,32 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         }
     }
 
+    // a split table reads each token from the table that holds it, the row from the other table is masked to zero
+    // the sum is taken before the inverse Hadamard transform in build_tok, so the transform runs once
+    auto lookup = [&](ggml_tensor * ids) {
+        if (!split || split->n_hi == 0) {
+            return ggml_get_rows(ctx0, tok_embd, ids);
+        }
+        auto rows = [&](ggml_tensor * table, ggml_tensor * row_ids, ggml_tensor * mask) {
+            ggml_tensor * table_ids = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, row_ids, ids), ids->ne[0]);
+            return ggml_mul(ctx0, ggml_get_rows(ctx0, table, table_ids), ggml_get_rows(ctx0, mask, ids));
+        };
+        ggml_tensor * hi = rows(tok_embd,      split->in_hidx, split->in_hmask);
+        ggml_tensor * lo = rows(split->tok_lo, split->in_lidx, split->in_lmask);
+        return ggml_add(ctx0, hi, lo);
+    };
+
     // the embeddings placeholders for the 3 paths
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        embd0 = lookup(inp->tokens);
         ggml_build_forward_order(gf, embd0);
 
         embd1 = inp->embd;
 
         if (has_mixed) {
-            embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
+            embd2 = lookup(inp->mixed_tokens);
             ggml_build_forward_order(gf, embd2);
         }
     }
