@@ -488,6 +488,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_PRISM_HADAMARD_WEIGHT_NAMES,         "prism.hadamard.weight_names"         },
     { LLM_KV_PRISM_HADAMARD_INVERSE_WEIGHT_NAMES, "prism.hadamard.inverse_weight_names" },
     { LLM_KV_PRISM_HADAMARD_GDN_V_GROUPED,        "prism.hadamard.gdn_v_grouped"        },
+    { LLM_KV_PRISM_HADAMARD_WEIGHT_BLOCK_SIZES,   "prism.hadamard.weight_block_sizes"   },
+    { LLM_KV_PRISM_HADAMARD_WEIGHT_SIGN_IDS,      "prism.hadamard.weight_sign_ids"      },
+    { LLM_KV_PRISM_HADAMARD_INVERSE_BLOCK_SIZES,  "prism.hadamard.inverse_block_sizes"  },
+    { LLM_KV_PRISM_HADAMARD_INVERSE_SIGN_IDS,     "prism.hadamard.inverse_sign_ids"     },
 
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },

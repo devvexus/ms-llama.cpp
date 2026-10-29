@@ -706,6 +706,10 @@ struct llama_hadamard {
 
     std::map<uint32_t, std::vector<int32_t>> sign_data;
 
+    // with sign ids: the sign vectors in file order (several can have the same width) and the index used by each weight
+    std::vector<std::vector<int32_t>> sign_sets;
+    std::unordered_map<std::string, uint32_t> sign_ids;
+
     bool gdn_v_grouped = false;
     bool tied_output = false;
 

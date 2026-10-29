@@ -551,6 +551,10 @@ class Keys:
         WEIGHT_NAMES         = "prism.hadamard.weight_names"
         INVERSE_WEIGHT_NAMES = "prism.hadamard.inverse_weight_names"
         GDN_V_GROUPED        = "prism.hadamard.gdn_v_grouped"
+        WEIGHT_BLOCK_SIZES   = "prism.hadamard.weight_block_sizes"
+        WEIGHT_SIGN_IDS      = "prism.hadamard.weight_sign_ids"
+        INVERSE_BLOCK_SIZES  = "prism.hadamard.inverse_block_sizes"
+        INVERSE_SIGN_IDS     = "prism.hadamard.inverse_sign_ids"
 
 
 #
