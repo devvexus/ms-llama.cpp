@@ -604,6 +604,24 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
     }
 }
 
+// A short row of large blocks leaves most warps idle when they split K, so each warp takes its own row instead.
+static constexpr __host__ __device__ bool mmvq_warp_rows(ggml_type type, int ncols_dst, bool small_k) {
+    if (!small_k || ncols_dst != 1) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -652,12 +670,18 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
+    // with warp_rows each warp computes its own rows, otherwise the warps split K and share all rows of the block
+    constexpr bool warp_rows       = mmvq_warp_rows(type, ncols_dst, small_k);
+    constexpr int  rows_per_thread = warp_rows ? rows_per_cuda_block/nwarps : rows_per_cuda_block;
+    constexpr int  nwarps_k        = warp_rows ? 1 : nwarps;
+    static_assert(!warp_rows || (rows_per_cuda_block >= nwarps && rows_per_cuda_block % nwarps == 0), "warp_rows needs whole rows per warp");
+
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int tid = warp_rows ? threadIdx.x : warp_size*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_cuda_block*blockIdx.x + (warp_rows ? rows_per_thread*threadIdx.y : 0);
     const     int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+    constexpr int blocks_per_iter = vdr * nwarps_k*warp_size / qi;
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
@@ -718,7 +742,7 @@ static __global__ void mul_mat_vec_q(
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
-        if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+        if (threadIdx.x < rows_per_thread && (warp_rows || threadIdx.y == 0) &&
             (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
@@ -746,8 +770,8 @@ static __global__ void mul_mat_vec_q(
     }
 
     // partial sum for each thread
-    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
-    float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+    float tmp[ncols_dst][rows_per_thread] = {{0.0f}};
+    float tmp_gate[ncols_dst][rows_per_thread] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
@@ -766,7 +790,7 @@ static __global__ void mul_mat_vec_q(
             const int kbx_pf = kbx + pf_dist*blocks_per_iter;
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                for (int i = 0; i < rows_per_thread; ++i) {
                     const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
                     mmvq_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
@@ -782,7 +806,7 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int i = 0; i < rows_per_thread; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
@@ -795,14 +819,14 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    __shared__ float tmp_shared[nwarps_k-1 > 0 ? nwarps_k-1 : 1][ncols_dst][rows_per_thread][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps_k-1 > 0)) ? nwarps_k-1 : 1][ncols_dst][rows_per_thread][warp_size];
 
-    if (threadIdx.y > 0) {
+    if (!warp_rows && threadIdx.y > 0) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int i = 0; i < rows_per_thread; ++i) {
                 tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
                 if constexpr (has_fusion) {
                     if (use_gate) {
@@ -812,8 +836,10 @@ static __global__ void mul_mat_vec_q(
             }
         }
     }
-    __syncthreads();
-    if (threadIdx.y > 0) {
+    if constexpr (!warp_rows) {
+        __syncthreads();
+    }
+    if (!warp_rows && threadIdx.y > 0) {
         return;
     }
 
@@ -823,9 +849,9 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-        for (int i = 0; i < rows_per_cuda_block; ++i) {
+        for (int i = 0; i < rows_per_thread; ++i) {
 #pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
+            for (int l = 0; l < nwarps_k-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
                 if constexpr (has_fusion) {
                     if (use_gate) {
