@@ -5105,6 +5105,180 @@ class tensor_traits_ms_c : public tensor_traits_base {
     }
 };
 
+// MS_C keeps its block layout. MUL_MAT with 16 or more src1 columns (prompt batches; token generation keeps the exact F32
+// vec_dot) writes each tile of src0 rows as Q8_0 blocks along a doubled row:
+// v = 32*hi + lo, the hi blocks with scale 32*d, then the lo blocks with scale d. src1 is quantized to Q8_0 and repeated along the
+// doubled row, so the Q8_0 GEMM (4x8 with i8mm, 4x4 with dotprod) gives the sum of d*v*a. Other cases use the default MUL_MAT.
+class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
+  public:
+    tensor_traits_ms_c_q8_0(int bits, int il) : k(bits), il(il) {}
+
+  private:
+    const int k;  // bits per weight
+    const int il; // interleave of block_q8_0x4: 8 for ggml_gemm_q8_0_4x8_q8_0, 4 for ggml_gemm_q8_0_4x4_q8_0
+
+    static bool use_q8_0(const struct ggml_tensor * op) {
+        const ggml_tensor * src1 = op->src[1];
+        return op->op == GGML_OP_MUL_MAT &&
+               src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+               src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 16;
+    }
+
+    // 4 rows of src0 or 4 columns of src1 as block_q8_0x4 along the doubled row
+    static size_t group_size(int64_t ne00) {
+        return 2*(ne00/QK8_0)*sizeof(block_q8_0x4);
+    }
+
+    // src0 rows per tile: up to about 256 KB of blocks, a multiple of nth tiles and at least two tiles per thread
+    static int64_t tile_rows(const struct ggml_tensor * src0, int nth) {
+        const int64_t ne01     = src0->ne[1];
+        const int64_t max_rows = MAX(8, MIN(64, 256*1024 / (2*src0->ne[0])));
+        const int64_t nchunk   = nth*MAX(2, (ne01 + nth*max_rows - 1) / (nth*max_rows));
+        return GGML_PAD((ne01 + nchunk - 1) / nchunk, 4);
+    }
+
+    // per thread: a tile of src0 rows, and the GEMM output of a partial group of rows or columns
+    static size_t slot_size(int64_t ne00, int64_t nr, int64_t ne11) {
+        return GGML_PAD((nr/4)*group_size(ne00), CACHE_LINE_SIZE) + GGML_PAD(4*MAX(nr, ne11)*sizeof(float), CACHE_LINE_SIZE);
+    }
+
+    // src1 in groups of 4 columns, the last group of src1 as F32 padded with zeros, then one slot per thread
+    static size_t wsize(const struct ggml_tensor * op, int nth) {
+        const int64_t ne00 = op->src[0]->ne[0];
+        const int64_t ne11 = op->src[1]->ne[1];
+        return CACHE_LINE_SIZE +
+               GGML_PAD((ne11 + 3)/4*group_size(ne00), CACHE_LINE_SIZE) +
+               GGML_PAD(4*ne00*sizeof(float), CACHE_LINE_SIZE) +
+               nth*slot_size(ne00, tile_rows(op->src[0], nth), ne11);
+    }
+
+    void gemm(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) const {
+        if (il == 8) {
+            ggml_gemm_q8_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
+        } else {
+            ggml_gemm_q8_0_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
+        }
+    }
+
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+        if (!use_q8_0(op)) {
+            return false;
+        }
+        size = wsize(op, n_threads);
+        return true;
+    }
+
+    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+        if (params->use_ref || !use_q8_0(op) || params->wsize < wsize(op, params->nth)) {
+            return false;
+        }
+
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+
+        GGML_ASSERT(op->ne[0] == src0->ne[1] && op->ne[1] == src1->ne[1]);
+        GGML_ASSERT(op->nb[0] == sizeof(float));
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        const int64_t ne00 = src0->ne[0];
+        const int64_t ne01 = src0->ne[1];
+        const int64_t ne11 = src1->ne[1];
+        const int64_t n4   = ne11 - ne11 % 4;
+        const size_t  gs   = group_size(ne00);
+        const int64_t nr   = tile_rows(src0, nth);
+        const int64_t ldd  = op->nb[1]/sizeof(float);
+
+        char  * wdata = (char *) GGML_PAD((uintptr_t) params->wdata, CACHE_LINE_SIZE);
+        char  * a     = wdata;
+        float * xt    = (float *) (a + GGML_PAD((ne11 + 3)/4*gs, CACHE_LINE_SIZE));
+        char  * slot  = (char *) xt + GGML_PAD(4*ne00*sizeof(float), CACHE_LINE_SIZE) + ith*slot_size(ne00, nr, ne11);
+        char  * w     = slot;
+        float * t     = (float *) (slot + GGML_PAD((nr/4)*gs, CACHE_LINE_SIZE));
+
+        // group g holds src1 columns 4g .. 4g + 3, and its second half repeats the first
+        for (int64_t g = ith; g < (ne11 + 3)/4; g += nth) {
+            const float * x = (const float *) ((const char *) src1->data + 4*g*src1->nb[1]);
+            if (4*g + 4 > ne11) {
+                memcpy(xt, x, (ne11 - 4*g)*ne00*sizeof(float));
+                memset(xt + (ne11 - 4*g)*ne00, 0, (4*g + 4 - ne11)*ne00*sizeof(float));
+                x = xt;
+            }
+            char * ag = a + g*gs;
+            if (il == 8) {
+                ggml_quantize_mat_q8_0_4x8(x, ag, ne00);
+            } else {
+                ggml_quantize_mat_q8_0_4x4(x, ag, ne00);
+            }
+            memcpy(ag + gs/2, ag, gs/2);
+        }
+
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        const int64_t nchunk = (ne01 + nr - 1)/nr;
+
+        int64_t chunk = ith;
+        while (chunk < nchunk) {
+            const int64_t ir0 = chunk*nr;
+            const int64_t m   = MIN(nr, ne01 - ir0);
+            const int64_t m4  = m - m % 4;
+            const int64_t mp  = GGML_PAD(m, 4);
+            float       * dst = (float *) op->data + ir0;
+
+            bool ok = true;
+            for (int64_t i = 0; i < m && ok; i += 4) {
+                ok = ggml_ms_c_to_q8_0x4(k, il, (const char *) src0->data + (ir0 + i)*src0->nb[1], src0->nb[1], (int) MIN(4, m - i), w + (i/4)*gs, ne00);
+            }
+
+            if (!ok) {
+                // 32*d of a block does not fit in FP16: exact F32 vec_dot for this tile
+                const ggml_vec_dot_t vec_dot = ggml_get_type_traits_cpu(src0->type)->vec_dot;
+                for (int64_t c = 0; c < ne11; c++) {
+                    for (int64_t i = 0; i < m; i++) {
+                        vec_dot((int) ne00, dst + c*ldd + i, 0, (const char *) src0->data + (ir0 + i)*src0->nb[1], 0,
+                                (const char *) src1->data + c*src1->nb[1], 0, 1);
+                    }
+                }
+            } else {
+                if (m4 > 0) {
+                    gemm((int) (2*ne00), dst, ldd, w, a, (int) n4, (int) m4);
+                }
+                // the last partial group of src0 rows, then the last partial group of src1 columns, through t
+                if (m4 < m) {
+                    gemm((int) (2*ne00), t, 4, w + (m4/4)*gs, a, (int) n4, 4);
+                    for (int64_t c = 0; c < n4; c++) {
+                        memcpy(dst + c*ldd + m4, t + 4*c, (m - m4)*sizeof(float));
+                    }
+                }
+                if (n4 < ne11) {
+                    gemm((int) (2*ne00), t, mp, w, a + (n4/4)*gs, 4, (int) mp);
+                    for (int64_t c = n4; c < ne11; c++) {
+                        memcpy(dst + c*ldd, t + (c - n4)*mp, m*sizeof(float));
+                    }
+                }
+            }
+
+            if (nth >= nchunk) {
+                break;
+            }
+            chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+
+        return true;
+    }
+
+    int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
+        GGML_LOG_DEBUG("%s: tensor %s keeps the %s layout\n", __func__, t->name, ggml_type_name(t->type));
+        memcpy(t->data, data, data_size);
+        return 0;
+    }
+};
+
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
@@ -5146,6 +5320,8 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 
     // instances for MS_C, one per bits per weight
     static const ggml::cpu::repack::tensor_traits_ms_c ms_c_i16[6] = { 1, 2, 3, 4, 5, 6 };
+    static const ggml::cpu::repack::tensor_traits_ms_c_q8_0 ms_c_q8_0_4x8[6] = { { 1, 8 }, { 2, 8 }, { 3, 8 }, { 4, 8 }, { 5, 8 }, { 6, 8 } };
+    static const ggml::cpu::repack::tensor_traits_ms_c_q8_0 ms_c_q8_0_4x4[6] = { { 1, 4 }, { 2, 4 }, { 3, 4 }, { 4, 4 }, { 5, 4 }, { 6, 4 } };
 
     // instances for RISC-V
     //
@@ -5326,6 +5502,12 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     } else if (ggml_ms_c_bits(cur->type) > 0) {
         if (ggml_cpu_has_avx2() && cur->ne[2] == 1 && cur->ne[3] == 1) {
             return &ms_c_i16[ggml_ms_c_bits(cur->type) - 1];
+        }
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[2] == 1 && cur->ne[3] == 1) {
+            return &ms_c_q8_0_4x8[ggml_ms_c_bits(cur->type) - 1];
+        }
+        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod() && cur->ne[2] == 1 && cur->ne[3] == 1) {
+            return &ms_c_q8_0_4x4[ggml_ms_c_bits(cur->type) - 1];
         }
     }
 
