@@ -43,11 +43,16 @@
 #include <omp.h>
 #endif
 
+// llamafile/sgemm.cpp is built: its F32 sgemm also serves the decode-once path below on targets where llamafile is not used otherwise
+#ifdef GGML_USE_LLAMAFILE
+#define GGML_CPU_SGEMM_F32 1
+#endif
+
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
 #undef GGML_USE_LLAMAFILE
 #endif
 
-#ifdef GGML_USE_LLAMAFILE
+#ifdef GGML_CPU_SGEMM_F32
 #include "llamafile/sgemm.h"
 #endif
 
@@ -1282,7 +1287,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
-#if GGML_USE_LLAMAFILE
+#if GGML_CPU_SGEMM_F32
 // vec_dot of a quantized type with F32 vec_dot_type decodes src0 again for every src1 column: for larger batches decode src0 to F32 once and use the F32 sgemm
 static bool ggml_cpu_mul_mat_use_dequant(const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__ARM_NEON) || defined(__VXE__) || defined(__VXE2__) || defined(__MMA__) || defined(__riscv_v_intrinsic)
@@ -1431,7 +1436,9 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 UseGgmlGemm1:;
+#endif
 
+#if GGML_CPU_SGEMM_F32
     if (ggml_compute_forward_mul_mat_dequant(params, dst)) {
         return;
     }
@@ -3008,7 +3015,7 @@ struct ggml_cplan ggml_graph_plan(
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
-#if GGML_USE_LLAMAFILE
+#if GGML_CPU_SGEMM_F32
                         if (ggml_cpu_mul_mat_use_dequant(node->src[0], node->src[1])) {
                             cur = MAX(cur, (size_t) (ggml_cpu_mul_mat_dequant_rows(node->src[0]) * node->src[0]->ne[0]) * sizeof(float));
                         }
