@@ -1556,9 +1556,15 @@ UseGgmlGemm2:;
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
     if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-        // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        // one src1 column: 3 chunks of at least 8 rows per thread, so that a slower thread (e.g. one that shares a core) takes fewer rows
+        const int64_t nchunk_mv = nth * 3;
+        if (nth > 1 && nr1 == 1 && nr0 >= nchunk_mv * 8 && !ggml_is_numa()) {
+            nchunk0 = nchunk_mv;
+        } else {
+            // distribute the thread work across the inner or outer loop based on which one is larger
+            nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+            nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        }
     }
 
     // The number of elements in each chunk
