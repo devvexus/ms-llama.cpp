@@ -94,6 +94,11 @@ void ggml_ms_c_to_f32(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRIC
 // v = weights / d, with one d per block
 void ggml_ms_c_to_i16(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n);
 
+// nr <= 4 rows of n weights (row stride bx, missing rows are 0) to 2*n/QK8_0 block_q8_0x4 with il = 4 or 8 bytes interleave:
+// v = 32*hi + lo with hi = ((v + 512) >> 5) - 16 and lo = (v + 512) & 31; blocks [0, n/QK8_0) hold hi with scale 32*d, the next n/QK8_0 hold lo with scale d
+// returns false, with vy incomplete, if a 32*d does not fit in FP16
+bool ggml_ms_c_to_q8_0x4(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
+
 // Generic implementation
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -136,6 +141,7 @@ void ggml_vec_dot_ms_c6_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
 void ggml_ms_c_to_f32_generic(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n);
 void ggml_ms_c_to_i16_generic(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n);
+bool ggml_ms_c_to_q8_0x4_generic(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
 
 #ifdef __cplusplus
 }

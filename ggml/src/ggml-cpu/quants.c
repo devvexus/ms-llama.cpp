@@ -1467,3 +1467,54 @@ void ggml_ms_c_to_i16_generic(int k, const void * GGML_RESTRICT vx, int16_t * GG
         }
     }
 }
+
+bool ggml_ms_c_to_q8_0x4_generic(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n) {
+    assert(n % QK_MS == 0);
+    assert(nr >= 1 && nr <= 4);
+    assert(il == 4 || il == 8);
+
+    const size_t  bs = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8; // MS_C block
+    const size_t  ys = 4*sizeof(ggml_half) + 4*QK8_0;                    // block_q8_0x4
+    const int64_t nb = n/QK8_0;
+
+    int16_t v[4][QK_MS];
+    float   d[4];
+
+    for (int64_t i = 0; i < n/QK_MS; i++) {
+        for (int r = 0; r < 4; r++) {
+            if (r < nr) {
+                ggml_ms_c_to_i16(k, (const char *) vx + r*bx + i*bs, v[r], &d[r], QK_MS);
+            } else {
+                memset(v[r], 0, sizeof(v[r]));
+                d[r] = 0.0f;
+            }
+            if (!(fabsf(d[r]) <= 65504.0f/32)) {
+                return false;
+            }
+        }
+
+        for (int j = 0; j < QK_MS/QK8_0; j++) {
+            uint8_t * yh = (uint8_t *) vy + (i*(QK_MS/QK8_0) + j)*ys;
+            uint8_t * yl = yh + nb*ys;
+
+            for (int r = 0; r < 4; r++) {
+                const ggml_half dh = GGML_CPU_FP32_TO_FP16(32.0f*d[r]);
+                const ggml_half dl = GGML_CPU_FP32_TO_FP16(d[r]);
+                memcpy(yh + r*sizeof(ggml_half), &dh, sizeof(dh));
+                memcpy(yl + r*sizeof(ggml_half), &dl, sizeof(dl));
+            }
+
+            int8_t * qh = (int8_t *) (yh + 4*sizeof(ggml_half));
+            int8_t * ql = (int8_t *) (yl + 4*sizeof(ggml_half));
+            for (int t = 0; t < 4*QK8_0; t++) {
+                const int r = (t/il) % 4;
+                const int e = (t/(4*il))*il + t % il;
+                const int u = v[r][j*QK8_0 + e] + 512;
+                qh[t] = (int8_t) ((u >> 5) - 16);
+                ql[t] = (int8_t) (u & 31);
+            }
+        }
+    }
+
+    return true;
+}

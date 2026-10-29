@@ -4478,6 +4478,112 @@ static inline void ms_c_row_to_f32_neon(const int k, const void * GGML_RESTRICT 
     }
 }
 
+#if defined(__aarch64__)
+// values 16*e .. 16*e + 15 of row r of a block_q8_0x4 with il bytes interleave, q = qs + 64*e
+static inline void ms_c_store16_q8_0x4_neon(int8_t * GGML_RESTRICT q, const int8x16_t x, const int r, const int il) {
+    if (il == 8) {
+        vst1_s8(q +  0 + 8*r, vget_low_s8(x));
+        vst1_s8(q + 32 + 8*r, vget_high_s8(x));
+    } else {
+        const int32x4_t x32 = vreinterpretq_s32_s8(x);
+        vst1q_lane_s32((int32_t *) (q +  0 + 4*r), x32, 0);
+        vst1q_lane_s32((int32_t *) (q + 16 + 4*r), x32, 1);
+        vst1q_lane_s32((int32_t *) (q + 32 + 4*r), x32, 2);
+        vst1q_lane_s32((int32_t *) (q + 48 + 4*r), x32, 3);
+    }
+}
+
+// the 512 values of one block as row r of 16 hi and 16 lo block_q8_0x4 (y[0] and y[1], ys bytes apart, scales not written)
+// with v in [-510, 510]: ((v + 512) >> 5) - 16 = v >> 5 and (v + 512) & 31 = v & 31
+static inline void ms_c_block_to_q8_0x4_neon(const int k, const int il, const uint8_t * GGML_RESTRICT qs, const uint32_t s0, const int r,
+                                             uint8_t * GGML_RESTRICT y[2], const size_t ys) {
+    const uint8x16_t i0 = vld1q_u8(ms_c_tbl[k - 1] +  0);
+    const uint8x16_t i1 = vld1q_u8(ms_c_tbl[k - 1] + 16);
+    const uint8x16_t i2 = vld1q_u8(ms_c_tbl[k - 1] + 32);
+    const uint8x16_t i3 = vld1q_u8(ms_c_tbl[k - 1] + 48);
+    const int32x4_t  h0 = vld1q_s32(ms_c_shl[k - 1] +  0);
+    const int32x4_t  h1 = vld1q_s32(ms_c_shl[k - 1] +  4);
+    const int32x4_t  h2 = vld1q_s32(ms_c_shl[k - 1] +  8);
+    const int32x4_t  h3 = vld1q_s32(ms_c_shl[k - 1] + 12);
+
+    const int nq = QK_MS*k/8;
+    const int gt = k == 1 ? 26 : k == 2 ? 29 : k == 3 ? 30 : 31;
+    uint8_t head[16];
+    uint8_t tail[32] = { 0 };
+    head[0] = (uint8_t) (s0 >> 8);
+    head[1] = (uint8_t) s0;
+    memcpy(head + 2, qs, 14);
+    memcpy(tail, qs + 2*k*gt - 2, nq + 2 - 2*k*gt);
+
+#define GGML_MS_C_GROUP_Q8_NEON(P, G)                                                                                   \
+    do {                                                                                                                \
+        const uint8x16_t b  = vld1q_u8(P);                                                                              \
+        const int32x4_t  v0 = ms_c_value4_neon(ms_c_state4_neon(b, i0, h0));                                            \
+        const int32x4_t  v1 = ms_c_value4_neon(ms_c_state4_neon(b, i1, h1));                                            \
+        const int32x4_t  v2 = ms_c_value4_neon(ms_c_state4_neon(b, i2, h2));                                            \
+        const int32x4_t  v3 = ms_c_value4_neon(ms_c_state4_neon(b, i3, h3));                                            \
+        const int16x8_t  w0 = vcombine_s16(vmovn_s32(v0), vmovn_s32(v1));                                               \
+        const int16x8_t  w1 = vcombine_s16(vmovn_s32(v2), vmovn_s32(v3));                                               \
+        const size_t     o  = ((G)/2)*ys + 4*sizeof(ggml_half) + 64*((G) % 2);                                          \
+        ms_c_store16_q8_0x4_neon((int8_t *) (y[0] + o), vcombine_s8(vshrn_n_s16(w0, 5), vshrn_n_s16(w1, 5)), r, il);    \
+        ms_c_store16_q8_0x4_neon((int8_t *) (y[1] + o),                                                                 \
+                vandq_s8(vcombine_s8(vmovn_s16(w0), vmovn_s16(w1)), vdupq_n_s8(31)), r, il);                            \
+    } while (0)
+
+    GGML_MS_C_GROUP_Q8_NEON(head, 0);
+    for (int g = 1; g < gt; ++g) {
+        GGML_MS_C_GROUP_Q8_NEON(qs + 2*k*g - 2, g);
+    }
+    for (int g = gt; g < QK_MS/16; ++g) {
+        GGML_MS_C_GROUP_Q8_NEON(tail + 2*k*(g - gt), g);
+    }
+#undef GGML_MS_C_GROUP_Q8_NEON
+}
+
+static bool ms_c_rows_to_q8_0x4_neon(const int k, const int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n) {
+    const size_t  bs = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8; // MS_C block
+    const size_t  ys = 4*sizeof(ggml_half) + 4*QK8_0;                    // block_q8_0x4
+    const int64_t nb = n/QK8_0;
+
+    for (int64_t i = 0; i < n/QK_MS; i++) {
+        uint8_t * y[2] = { (uint8_t *) vy + i*(QK_MS/QK8_0)*ys, (uint8_t *) vy + (nb + i*(QK_MS/QK8_0))*ys };
+        if (nr < 4) {
+            memset(y[0], 0, (QK_MS/QK8_0)*ys);
+            memset(y[1], 0, (QK_MS/QK8_0)*ys);
+        }
+        for (int r = 0; r < nr; r++) {
+            const uint8_t * x = (const uint8_t *) vx + r*bx + i*bs;
+            ggml_half dl;
+            uint16_t  s0;
+            memcpy(&dl, x, sizeof(dl));
+            memcpy(&s0, x + sizeof(dl), sizeof(s0));
+            const float d = GGML_CPU_FP16_TO_FP32(dl);
+            if (!(fabsf(d) <= 65504.0f/32)) {
+                return false;
+            }
+            const ggml_half dh = GGML_CPU_FP32_TO_FP16(32.0f*d);
+            for (int j = 0; j < QK_MS/QK8_0; j++) {
+                memcpy(y[0] + j*ys + r*sizeof(ggml_half), &dh, sizeof(dh));
+                memcpy(y[1] + j*ys + r*sizeof(ggml_half), &dl, sizeof(dl));
+            }
+            const uint8_t * qs = x + sizeof(dl) + sizeof(s0);
+            const uint32_t  st = s0 & GGML_MS_STATE_MASK;
+            switch (k) {
+                case 1: ms_c_block_to_q8_0x4_neon(1, il, qs, st, r, y, ys); break;
+                case 2: ms_c_block_to_q8_0x4_neon(2, il, qs, st, r, y, ys); break;
+                case 3: ms_c_block_to_q8_0x4_neon(3, il, qs, st, r, y, ys); break;
+                case 4: ms_c_block_to_q8_0x4_neon(4, il, qs, st, r, y, ys); break;
+                case 5: ms_c_block_to_q8_0x4_neon(5, il, qs, st, r, y, ys); break;
+                case 6: ms_c_block_to_q8_0x4_neon(6, il, qs, st, r, y, ys); break;
+                default: GGML_ABORT("invalid MS_C bits");
+            }
+        }
+    }
+
+    return true;
+}
+#endif
+
 #define GGML_MS_C_VEC_DOT_NEON(K)                                                                                     \
     const block_ms_c##K * GGML_RESTRICT x = vx;                                                                         \
     const float * GGML_RESTRICT y = vy;                                                                                 \
@@ -4605,5 +4711,16 @@ void ggml_ms_c_to_i16(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTR
     }
 #else
     ggml_ms_c_to_i16_generic(k, vx, v, d, n);
+#endif
+}
+
+bool ggml_ms_c_to_q8_0x4(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n) {
+    assert(n % QK_MS == 0);
+    assert(nr >= 1 && nr <= 4);
+    assert(il == 4 || il == 8);
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    return ms_c_rows_to_q8_0x4_neon(k, il, vx, bx, nr, vy, n);
+#else
+    return ggml_ms_c_to_q8_0x4_generic(k, il, vx, bx, nr, vy, n);
 #endif
 }
