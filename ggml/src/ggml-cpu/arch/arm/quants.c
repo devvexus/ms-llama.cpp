@@ -4344,12 +4344,28 @@ static const int32_t ms_c_shl[6][16] = {
 };
 
 // values of 4 states: x = A*s + B, then (sum of the 4 bytes of x) - 510
+// x = A*s + B as MUL then ADD: a 32-bit vector MLA issues at about half the rate of MUL on cores such as Cortex-X925
+static inline uint8x16_t ms_c_hash4_neon(const uint32x4_t st) {
+    return vreinterpretq_u8_u32(vaddq_u32(vmulq_u32(st, vdupq_n_u32(GGML_MS_C_A)), vdupq_n_u32(GGML_MS_C_B)));
+}
+
 static inline int32x4_t ms_c_value4_neon(const uint32x4_t st) {
-    const uint32x4_t x = vmlaq_u32(vdupq_n_u32(GGML_MS_C_B), st, vdupq_n_u32(GGML_MS_C_A));
+    const uint8x16_t x = ms_c_hash4_neon(st);
 #if defined(__ARM_FEATURE_DOTPROD)
-    return vreinterpretq_s32_u32(vdotq_u32(vdupq_n_u32((uint32_t) -510), vreinterpretq_u8_u32(x), vdupq_n_u8(1)));
+    return vreinterpretq_s32_u32(vdotq_u32(vdupq_n_u32((uint32_t) -510), x, vdupq_n_u8(1)));
 #else
-    return vsubq_s32(vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(vreinterpretq_u8_u32(x)))), vdupq_n_s32(510));
+    return vsubq_s32(vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(x))), vdupq_n_s32(510));
+#endif
+}
+
+// the values as F32: the byte sum is added onto the bits of 2^23, which gives 2^23 + sum exactly (sum < 2^23), and one FSUB of
+// 2^23 + 510 then gives the value exactly, instead of an int to float conversion (slower than FSUB on such cores)
+static inline float32x4_t ms_c_valuef4_neon(const uint32x4_t st) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    const uint32x4_t f = vdotq_u32(vdupq_n_u32(0x4B000000u), ms_c_hash4_neon(st), vdupq_n_u8(1));
+    return vsubq_f32(vreinterpretq_f32_u32(f), vdupq_n_f32(8388608.0f + 510.0f));
+#else
+    return vcvtq_f32_s32(ms_c_value4_neon(st));
 #endif
 }
 
@@ -4384,10 +4400,10 @@ static inline float ms_c_block_dot_neon(const int k, const uint8_t * GGML_RESTRI
     do {                                                                                                                \
         const uint8x16_t v = vld1q_u8(P);                                                                               \
         const float * yg = y + 16*(G);                                                                                  \
-        acc[0] = vfmaq_f32(acc[0], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i0, h0))), vld1q_f32(yg +  0));  \
-        acc[1] = vfmaq_f32(acc[1], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i1, h1))), vld1q_f32(yg +  4));  \
-        acc[2] = vfmaq_f32(acc[2], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i2, h2))), vld1q_f32(yg +  8));  \
-        acc[3] = vfmaq_f32(acc[3], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i3, h3))), vld1q_f32(yg + 12));  \
+        acc[0] = vfmaq_f32(acc[0], ms_c_valuef4_neon(ms_c_state4_neon(v, i0, h0)), vld1q_f32(yg +  0));  \
+        acc[1] = vfmaq_f32(acc[1], ms_c_valuef4_neon(ms_c_state4_neon(v, i1, h1)), vld1q_f32(yg +  4));  \
+        acc[2] = vfmaq_f32(acc[2], ms_c_valuef4_neon(ms_c_state4_neon(v, i2, h2)), vld1q_f32(yg +  8));  \
+        acc[3] = vfmaq_f32(acc[3], ms_c_valuef4_neon(ms_c_state4_neon(v, i3, h3)), vld1q_f32(yg + 12));  \
     } while (0)
 
     GGML_MS_C_GROUP_NEON(head, 0);
