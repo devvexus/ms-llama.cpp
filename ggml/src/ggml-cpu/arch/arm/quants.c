@@ -4320,3 +4320,174 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+// ============================ MS_C bit-shift trellis
+
+#if defined(__ARM_NEON)
+// The states of a block are 14-bit windows of one big-endian bit stream P: s0 as 16 bits (top 2 bits zero), then qs. State i is
+// bits [i*k + 2, i*k + 16) of P, so the 16 states of group g start at byte 2*k*g of P and all lie in the 16 bytes from there:
+// lane j is the big-endian 32-bit word at byte (j*k + 2)/8 of those (ms_c_tbl), shifted left by (j*k + 2)%8 (ms_c_shl) and right by 18.
+static const uint8_t ms_c_tbl[6][64] = {
+    { 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 5, 4, 3, 2, 5, 4, 3, 2 },
+    { 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 5, 4, 3, 2, 5, 4, 3, 2, 5, 4, 3, 2, 5, 4, 3, 2, 6, 5, 4, 3, 6, 5, 4, 3, 6, 5, 4, 3, 6, 5, 4, 3, 7, 6, 5, 4 },
+    { 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 5, 4, 3, 2, 5, 4, 3, 2, 5, 4, 3, 2, 6, 5, 4, 3, 6, 5, 4, 3, 7, 6, 5, 4, 7, 6, 5, 4, 7, 6, 5, 4, 8, 7, 6, 5, 8, 7, 6, 5, 8, 7, 6, 5 },
+    { 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 4, 3, 2, 1, 5, 4, 3, 2, 5, 4, 3, 2, 6, 5, 4, 3, 6, 5, 4, 3, 7, 6, 5, 4, 7, 6, 5, 4, 8, 7, 6, 5, 8, 7, 6, 5, 9, 8, 7, 6, 9, 8, 7, 6, 10, 9, 8, 7, 10, 9, 8, 7 },
+    { 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 5, 4, 3, 2, 5, 4, 3, 2, 6, 5, 4, 3, 7, 6, 5, 4, 7, 6, 5, 4, 8, 7, 6, 5, 8, 7, 6, 5, 9, 8, 7, 6, 10, 9, 8, 7, 10, 9, 8, 7, 11, 10, 9, 8, 12, 11, 10, 9, 12, 11, 10, 9 },
+    { 3, 2, 1, 0, 4, 3, 2, 1, 4, 3, 2, 1, 5, 4, 3, 2, 6, 5, 4, 3, 7, 6, 5, 4, 7, 6, 5, 4, 8, 7, 6, 5, 9, 8, 7, 6, 10, 9, 8, 7, 10, 9, 8, 7, 11, 10, 9, 8, 12, 11, 10, 9, 13, 12, 11, 10, 13, 12, 11, 10, 14, 13, 12, 11 },
+};
+static const int32_t ms_c_shl[6][16] = {
+    { 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1 },
+    { 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0 },
+    { 2, 5, 0, 3, 6, 1, 4, 7, 2, 5, 0, 3, 6, 1, 4, 7 },
+    { 2, 6, 2, 6, 2, 6, 2, 6, 2, 6, 2, 6, 2, 6, 2, 6 },
+    { 2, 7, 4, 1, 6, 3, 0, 5, 2, 7, 4, 1, 6, 3, 0, 5 },
+    { 2, 0, 6, 4, 2, 0, 6, 4, 2, 0, 6, 4, 2, 0, 6, 4 },
+};
+
+// values of 4 states: x = A*s + B, then (sum of the 4 bytes of x) - 510
+static inline int32x4_t ms_c_value4_neon(const uint32x4_t st) {
+    const uint32x4_t x = vmlaq_u32(vdupq_n_u32(GGML_MS_C_B), st, vdupq_n_u32(GGML_MS_C_A));
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vreinterpretq_s32_u32(vdotq_u32(vdupq_n_u32((uint32_t) -510), vreinterpretq_u8_u32(x), vdupq_n_u8(1)));
+#else
+    return vsubq_s32(vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(vreinterpretq_u8_u32(x)))), vdupq_n_s32(510));
+#endif
+}
+
+static inline uint32x4_t ms_c_state4_neon(const uint8x16_t p, const uint8x16_t idx, const int32x4_t shl) {
+    return vshrq_n_u32(vshlq_u32(vreinterpretq_u32_u8(vqtbl1q_u8(p, idx)), shl), 32 - GGML_MS_L);
+}
+
+// sum over the block of value_i * y_i (without the scale d)
+static inline float ms_c_block_dot_neon(const int k, const uint8_t * GGML_RESTRICT qs, const uint32_t s0, const float * GGML_RESTRICT y) {
+    const uint8x16_t i0 = vld1q_u8(ms_c_tbl[k - 1] +  0);
+    const uint8x16_t i1 = vld1q_u8(ms_c_tbl[k - 1] + 16);
+    const uint8x16_t i2 = vld1q_u8(ms_c_tbl[k - 1] + 32);
+    const uint8x16_t i3 = vld1q_u8(ms_c_tbl[k - 1] + 48);
+    const int32x4_t  h0 = vld1q_s32(ms_c_shl[k - 1] +  0);
+    const int32x4_t  h1 = vld1q_s32(ms_c_shl[k - 1] +  4);
+    const int32x4_t  h2 = vld1q_s32(ms_c_shl[k - 1] +  8);
+    const int32x4_t  h3 = vld1q_s32(ms_c_shl[k - 1] + 12);
+
+    // group 0 holds s0, and the groups from gt on would read past the block: both are read from copies of P
+    const int nq = QK_MS*k/8;
+    const int gt = k == 1 ? 26 : k == 2 ? 29 : k == 3 ? 30 : 31;
+    uint8_t head[16];
+    uint8_t tail[32] = { 0 };
+    head[0] = (uint8_t) (s0 >> 8);
+    head[1] = (uint8_t) s0;
+    memcpy(head + 2, qs, 14);
+    memcpy(tail, qs + 2*k*gt - 2, nq + 2 - 2*k*gt);
+
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    for (int g = 0; g < QK_MS/16; ++g) {
+        const uint8_t * p = g == 0 ? head : g < gt ? qs + 2*k*g - 2 : tail + 2*k*(g - gt);
+        const uint8x16_t v = vld1q_u8(p);
+        const float * yg = y + 16*g;
+        acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i0, h0))), vld1q_f32(yg +  0));
+        acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i1, h1))), vld1q_f32(yg +  4));
+        acc2 = vfmaq_f32(acc2, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i2, h2))), vld1q_f32(yg +  8));
+        acc3 = vfmaq_f32(acc3, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i3, h3))), vld1q_f32(yg + 12));
+    }
+
+    return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+}
+
+#define GGML_MS_C_VEC_DOT_NEON(K)                                                                                       \
+    const block_ms_c##K * GGML_RESTRICT x = vx;                                                                         \
+    const float * GGML_RESTRICT y = vy;                                                                                 \
+    float sumf = 0.0f;                                                                                                  \
+    for (int i = 0; i < n / QK_MS; i++) {                                                                               \
+        const float sumb = ms_c_block_dot_neon(K, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, y + i*QK_MS);                \
+        sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * sumb;                                                                   \
+    }                                                                                                                   \
+    *s = sumf;
+#endif
+
+void ggml_vec_dot_ms_c1_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    GGML_MS_C_VEC_DOT_NEON(1)
+#else
+    ggml_vec_dot_ms_c1_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    GGML_MS_C_VEC_DOT_NEON(2)
+#else
+    ggml_vec_dot_ms_c2_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    GGML_MS_C_VEC_DOT_NEON(3)
+#else
+    ggml_vec_dot_ms_c3_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    GGML_MS_C_VEC_DOT_NEON(4)
+#else
+    ggml_vec_dot_ms_c4_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c5_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    GGML_MS_C_VEC_DOT_NEON(5)
+#else
+    ggml_vec_dot_ms_c5_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c6_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    GGML_MS_C_VEC_DOT_NEON(6)
+#else
+    ggml_vec_dot_ms_c6_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
