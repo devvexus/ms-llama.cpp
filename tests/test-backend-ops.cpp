@@ -5589,6 +5589,105 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+enum mul_hadamard_prod_use {
+    MUL_HADAMARD_PROD_FUSE,   // only the transform reads the product
+    MUL_HADAMARD_PROD_READ,   // another op also reads the product, so the ops must not be fused
+    MUL_HADAMARD_PROD_OUTPUT, // the product is a graph output, so the ops must not be fused
+};
+
+static std::string var_to_str(mul_hadamard_prod_use prod_use) {
+    switch (prod_use) {
+        case MUL_HADAMARD_PROD_FUSE:   return "fuse";
+        case MUL_HADAMARD_PROD_READ:   return "read";
+        case MUL_HADAMARD_PROD_OUTPUT: return "output";
+    }
+    return "unknown";
+}
+
+// MUL by a vector that is broadcast over the rows, then GGML_HINT_SRC0_IS_HADAMARD on the product reshaped to rows of n
+struct test_mul_hadamard : public test_case {
+    const int64_t n;
+    const std::array<int64_t, 4> ne;
+    const bool v_first;
+    const mul_hadamard_prod_use prod_use;
+
+    ggml_tensor * prod = nullptr;
+    ggml_tensor * out  = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_HADAMARD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (prod_use == MUL_HADAMARD_PROD_OUTPUT) {
+            return { prod, out };
+        }
+        return { out };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, ne, v_first, prod_use);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_hadamard(int64_t n = 512, std::array<int64_t, 4> ne = {1024, 1, 1, 1}, bool v_first = false,
+            mul_hadamard_prod_use prod_use = MUL_HADAMARD_PROD_FUSE)
+        : n(n), ne(ne), v_first(v_first), prod_use(prod_use) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_tensor * v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(v, "v");
+        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        ggml_set_name(h, "h");
+
+        prod = v_first ? ggml_mul(ctx, v, x) : ggml_mul(ctx, x, v);
+        ggml_set_name(prod, "prod");
+        if (prod_use == MUL_HADAMARD_PROD_OUTPUT) {
+            ggml_set_output(prod);
+        }
+
+        out = ggml_reshape_2d(ctx, prod, n, ggml_nelements(prod)/n);
+        out = ggml_mul_mat(ctx, h, out);
+        ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+
+        if (prod_use == MUL_HADAMARD_PROD_READ) {
+            out = ggml_add(ctx, out, ggml_scale(ctx, ggml_sum(ctx, prod), 1.0f/ggml_nelements(prod)));
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "h") == 0) {
+                std::vector<float> data(n*n);
+                const float scale = 1.0f / sqrtf((float) n);
+                for (int64_t r = 0; r < n; r++) {
+                    for (int64_t i = 0; i < n; i++) {
+                        int parity = 0;
+                        for (int64_t b = r & i; b; b &= b - 1) {
+                            parity ^= 1;
+                        }
+                        data[r*n + i] = parity ? -scale : scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -11129,6 +11228,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 4096, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 8192, 1, 8192));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 7, 1024));  // many rows
+
+    for (int64_t n : {64, 128, 256, 512, 1024, 2048, 4096}) {
+        for (int64_t ntok : {1, 5}) {
+            test_cases.emplace_back(new test_mul_hadamard(n, {2*n, ntok, 1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_hadamard(8192, {8192, 1, 1, 1}));
+    test_cases.emplace_back(new test_mul_hadamard(512, {3584, 1, 1, 1}));
+    test_cases.emplace_back(new test_mul_hadamard(512, {3584, 1, 1, 1}, true));
+    test_cases.emplace_back(new test_mul_hadamard(1024, {1024, 1, 1, 1}, true));
+    test_cases.emplace_back(new test_mul_hadamard(1024, {1024, 4, 2, 1}));
+    for (mul_hadamard_prod_use prod_use : {MUL_HADAMARD_PROD_READ, MUL_HADAMARD_PROD_OUTPUT}) {
+        test_cases.emplace_back(new test_mul_hadamard(1024, {1024, 1, 1, 1}, false, prod_use));
+    }
 
     // FP4 activation precision (default = native W4A4, src1 GGML_PREC_Q8 = W4A8)
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32,  1, 256));
