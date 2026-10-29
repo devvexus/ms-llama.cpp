@@ -4502,3 +4502,61 @@ void ggml_ms_c_to_f32(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRIC
     ggml_ms_c_to_f32_generic(k, vx, y, n);
 #endif
 }
+
+void ggml_ms_c_to_i16(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+
+    const size_t    bs = MS_C_QS_OFFSET + k*QK_MS/8;
+    const uint8_t * x  = (const uint8_t *) vx;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    ms_c_lut_avx512 lut;
+    ms_c_lut_init_avx512(k, &lut);
+
+    for (int64_t i = 0; i < n/QK_MS; i++) {
+        const uint8_t * qs = x + i*bs + MS_C_QS_OFFSET;
+        int16_t       * vb = v + i*QK_MS;
+
+        d[i] = ms_c_block_d(x + i*bs);
+
+        _mm256_storeu_si256((__m256i *) vb, _mm512_cvtepi32_epi16(ms_c_group_avx512(k, qs, 0, &lut)));
+        int h = 1;
+        for (; h <= lut.h1; h++) {
+            _mm256_storeu_si256((__m256i *) (vb + 16*h), _mm512_cvtepi32_epi16(ms_c_group_fast_avx512(k, qs, h, &lut)));
+        }
+        for (; h < QK_MS/16; h++) {
+            _mm256_storeu_si256((__m256i *) (vb + 16*h), _mm512_cvtepi32_epi16(ms_c_group_avx512(k, qs, h, &lut)));
+        }
+    }
+#else
+    ms_c_lut_avx2 lut;
+    ms_c_lut_init_avx2(k, &lut);
+
+    // groups in pairs: g0 <= 2 and groups 0, 1 take the general path
+    for (int64_t i = 0; i < n/QK_MS; i++) {
+        const uint8_t * qs = x + i*bs + MS_C_QS_OFFSET;
+        int16_t       * vb = v + i*QK_MS;
+
+        d[i] = ms_c_block_d(x + i*bs);
+
+        __m256i v0 = ms_c_group_avx2(k, qs, 0, &lut);
+        __m256i v1 = ms_c_group_avx2(k, qs, 1, &lut);
+        _mm256_storeu_si256((__m256i *) vb, _mm256_permute4x64_epi64(_mm256_packs_epi32(v0, v1), 0xD8));
+        int g = 2;
+        for (; g < lut.g1; g += 2) {
+            v0 = ms_c_group_fast_avx2(k, qs, g + 0, &lut);
+            v1 = ms_c_group_fast_avx2(k, qs, g + 1, &lut);
+            _mm256_storeu_si256((__m256i *) (vb + 8*g), _mm256_permute4x64_epi64(_mm256_packs_epi32(v0, v1), 0xD8));
+        }
+        for (; g < QK_MS/8; g += 2) {
+            v0 = ms_c_group_avx2(k, qs, g + 0, &lut);
+            v1 = ms_c_group_avx2(k, qs, g + 1, &lut);
+            _mm256_storeu_si256((__m256i *) (vb + 8*g), _mm256_permute4x64_epi64(_mm256_packs_epi32(v0, v1), 0xD8));
+        }
+    }
+#endif
+#else
+    ggml_ms_c_to_i16_generic(k, vx, v, d, n);
+#endif
+}

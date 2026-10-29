@@ -1425,3 +1425,45 @@ void ggml_ms_c_to_f32_generic(int k, const void * GGML_RESTRICT vx, float * GGML
         default: GGML_ABORT("invalid MS_C bits");
     }
 }
+
+static inline int16_t ms_c_value(uint32_t s) {
+    const uint32_t x = GGML_MS_C_A*s + GGML_MS_C_B;
+    return (int16_t) ((int) ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)) - 510);
+}
+
+void ggml_ms_c_to_i16_generic(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n) {
+    assert(n % QK_MS == 0);
+
+    // all MS_C blocks are {ggml_half d, uint16_t s0, uint8_t qs[k*QK_MS/8]}
+    const size_t   bs   = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8;
+    const uint32_t mask = (1u << k) - 1;
+
+    for (int64_t i = 0; i < n/QK_MS; i++) {
+        const uint8_t * x = (const uint8_t *) vx + i*bs;
+
+        ggml_half dh;
+        uint16_t  s0;
+        memcpy(&dh, x, sizeof(dh));
+        memcpy(&s0, x + sizeof(dh), sizeof(s0));
+        const uint8_t * qs = x + sizeof(dh) + sizeof(s0);
+
+        d[i] = GGML_CPU_FP16_TO_FP32(dh);
+
+        int16_t * vb = v + i*QK_MS;
+
+        uint32_t st  = s0 & GGML_MS_STATE_MASK;
+        uint32_t acc = 0;
+        int nbits = 0;
+
+        vb[0] = ms_c_value(st);
+        for (int j = 1; j < QK_MS; j++) {
+            if (nbits < k) {
+                acc = (acc << 8) | *qs++;
+                nbits += 8;
+            }
+            nbits -= k;
+            st = ((st << k) | ((acc >> nbits) & mask)) & GGML_MS_STATE_MASK;
+            vb[j] = ms_c_value(st);
+        }
+    }
+}

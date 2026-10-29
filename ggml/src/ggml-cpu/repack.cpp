@@ -8,12 +8,15 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "traits.h"
+#include "ops.h"
+#include "quants.h"
 
 #include "arch-fallback.h"
 
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <cfloat>
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
@@ -306,6 +309,32 @@ void ggml_quantize_mat_q8_K_4x8_generic(const float * GGML_RESTRICT x, void * GG
             float x0 = srcv[src_id][src_offset] * iscale[src_id];
             y[i].qs[j] = nearest_int(x0);
             y[i].bsums[index] += y[i].qs[j];
+        }
+    }
+}
+
+void ggml_ms_c_quantize_i16_generic(const float * GGML_RESTRICT x, int16_t * GGML_RESTRICT q, float * GGML_RESTRICT s, int64_t n, int64_t ldq) {
+    assert(n % QK_MS == 0);
+
+    for (int64_t b = 0; b < n/QK_MS; b++) {
+        const float * xb = x + b*QK_MS;
+
+        float amax   = 0.0f;
+        bool  finite = true;
+        for (int j = 0; j < QK_MS; j++) {
+            const float ax = fabsf(xb[j]);
+            amax   = MAX(amax, ax);
+            finite = finite && ax <= FLT_MAX;
+        }
+
+        // GGML_MS_C_Q16_MAX/amax overflows for amax below about 2.4e-35: such a block is quantized to 0
+        s[b*ldq] = finite ? amax / GGML_MS_C_Q16_MAX : NAN;
+        const float id = finite && amax > GGML_MS_C_Q16_MAX / FLT_MAX ? GGML_MS_C_Q16_MAX / amax : 0.0f;
+
+        int16_t * qb = q + b*(QK_MS/2)*ldq*2;
+        for (int p = 0; p < QK_MS/2; p++) {
+            qb[p*ldq*2 + 0] = finite ? (int16_t) lrintf(xb[2*p + 0]*id) : 0;
+            qb[p*ldq*2 + 1] = finite ? (int16_t) lrintf(xb[2*p + 1]*id) : 0;
         }
     }
 }
@@ -2680,6 +2709,28 @@ void ggml_gemm_q1_0_4x8_q8_0_generic(int                        n,
     }
 }
 
+void ggml_ms_c_gemm_i16_generic(int64_t n, int nr, int nc, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d,
+                                const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT dst, int64_t ldd) {
+    assert(n % QK_MS == 0);
+
+    const int64_t nb = n/QK_MS;
+
+    for (int c = 0; c < nc; c++) {
+        for (int r = 0; r < nr; r++) {
+            float sumf = 0.0f;
+            for (int64_t b = 0; b < nb; b++) {
+                int32_t sumi = 0;
+                for (int64_t p = b*QK_MS/2; p < (b + 1)*QK_MS/2; p++) {
+                    const int16_t * qp = q + (p*ldq + c)*2;
+                    sumi += v[r*n + 2*p + 0]*qp[0] + v[r*n + 2*p + 1]*qp[1];
+                }
+                sumf += (float) sumi * (d[r*nb + b] * s[b*ldq + c]);
+            }
+            dst[c*ldd + r] = sumf;
+        }
+    }
+}
+
 // Only enable these for RISC-V.
 #if defined __riscv_zvfh
 void ggml_gemm_q4_0_16x1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -4925,6 +4976,135 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     }
 };
 
+// MS_C keeps its block layout. MUL_MAT with 4 or more src1 columns quantizes src1 to int16 with one scale per block,
+// decodes each src0 row once to int16 and runs an int16 GEMM. Other cases use the default MUL_MAT (exact F32 activations).
+class tensor_traits_ms_c : public tensor_traits_base {
+  public:
+    tensor_traits_ms_c(int bits) : k(bits) {}
+
+  private:
+    const int k; // bits per weight
+
+    static bool use_i16(const struct ggml_tensor * op) {
+        const ggml_tensor * src1 = op->src[1];
+        return op->op == GGML_OP_MUL_MAT &&
+               src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+               src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 4;
+    }
+
+    // src0 rows per tile: up to about 256 KB of int16, a multiple of nth tiles and at least two tiles per thread
+    static int64_t tile_rows(const struct ggml_tensor * src0, int nth) {
+        const int64_t ne01     = src0->ne[1];
+        const int64_t max_rows = MAX(8, MIN(64, 256*1024 / (src0->ne[0]*(int64_t) sizeof(int16_t))));
+        const int64_t nchunk   = nth*MAX(2, (ne01 + nth*max_rows - 1) / (nth*max_rows));
+        return GGML_PAD((ne01 + nchunk - 1) / nchunk, GGML_MS_C_ROWS_PAD);
+    }
+
+    // per thread: nr decoded src0 rows and their block scales
+    static size_t slot_size(int64_t ne00, int64_t nr) {
+        return GGML_PAD(nr*ne00*sizeof(int16_t), CACHE_LINE_SIZE) + GGML_PAD(nr*(ne00/QK_MS)*sizeof(float), CACHE_LINE_SIZE);
+    }
+
+    // src1 as int16 pairs [ne00/2][ncp][2], its block scales [ne00/QK_MS][ncp], then one slot per thread
+    static size_t wsize(const struct ggml_tensor * op, int nth) {
+        const int64_t ne00 = op->src[0]->ne[0];
+        const int64_t ncp  = GGML_PAD(op->src[1]->ne[1], GGML_MS_C_COLS_PAD);
+        return CACHE_LINE_SIZE +
+               GGML_PAD(ne00*ncp*sizeof(int16_t), CACHE_LINE_SIZE) +
+               GGML_PAD((ne00/QK_MS)*ncp*sizeof(float), CACHE_LINE_SIZE) +
+               nth*slot_size(ne00, tile_rows(op->src[0], nth));
+    }
+
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+        if (!use_i16(op)) {
+            return false;
+        }
+        size = wsize(op, n_threads);
+        return true;
+    }
+
+    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+        if (params->use_ref || !use_i16(op) || params->wsize < wsize(op, params->nth)) {
+            return false;
+        }
+
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+
+        GGML_ASSERT(op->ne[0] == src0->ne[1] && op->ne[1] == src1->ne[1]);
+        GGML_ASSERT(op->nb[0] == sizeof(float));
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        const int64_t ne00 = src0->ne[0];
+        const int64_t ne01 = src0->ne[1];
+        const int64_t ne11 = src1->ne[1];
+        const int64_t nb   = ne00/QK_MS;
+        const int64_t ncp  = GGML_PAD(ne11, GGML_MS_C_COLS_PAD);
+        const int64_t nr   = tile_rows(src0, nth);
+
+        char    * wdata = (char *) GGML_PAD((uintptr_t) params->wdata, CACHE_LINE_SIZE);
+        int16_t * q     = (int16_t *) wdata;
+        float   * s     = (float *) (wdata + GGML_PAD(ne00*ncp*sizeof(int16_t), CACHE_LINE_SIZE));
+        char    * slot  = (char *) s + GGML_PAD(nb*ncp*sizeof(float), CACHE_LINE_SIZE) + ith*slot_size(ne00, nr);
+        int16_t * v     = (int16_t *) slot;
+        float   * d     = (float *) (slot + GGML_PAD(nr*ne00*sizeof(int16_t), CACHE_LINE_SIZE));
+
+        // each thread quantizes whole cache lines of q and s
+        const int64_t dc = GGML_PAD((ncp + nth - 1)/nth, GGML_MS_C_COLS_PAD);
+        for (int64_t c = dc*ith; c < MIN(dc*(ith + 1), ncp); c++) {
+            if (c < ne11) {
+                ggml_ms_c_quantize_i16((const float *) ((const char *) src1->data + c*src1->nb[1]), q + 2*c, s + c, ne00, ncp);
+            } else {
+                for (int64_t p = 0; p < ne00/2; p++) {
+                    q[2*(p*ncp + c) + 0] = 0;
+                    q[2*(p*ncp + c) + 1] = 0;
+                }
+                for (int64_t b = 0; b < nb; b++) {
+                    s[b*ncp + c] = 0.0f;
+                }
+            }
+        }
+
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        const int64_t nchunk = (ne01 + nr - 1)/nr;
+
+        int64_t chunk = ith;
+        while (chunk < nchunk) {
+            const int64_t ir0 = chunk*nr;
+            const int64_t m   = MIN(nr, ne01 - ir0);
+            const int64_t mp  = GGML_PAD(m, GGML_MS_C_ROWS_PAD);
+
+            for (int64_t i = 0; i < m; i++) {
+                ggml_ms_c_to_i16(k, (const char *) src0->data + (ir0 + i)*src0->nb[1], v + i*ne00, d + i*nb, ne00);
+            }
+            memset(v + m*ne00, 0, (mp - m)*ne00*sizeof(int16_t));
+            memset(d + m*nb,   0, (mp - m)*nb*sizeof(float));
+
+            ggml_ms_c_gemm_i16(ne00, (int) m, (int) ne11, v, d, q, ncp, s, (float *) op->data + ir0, op->nb[1]/sizeof(float));
+
+            if (nth >= nchunk) {
+                break;
+            }
+            chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+
+        return true;
+    }
+
+    int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
+        GGML_LOG_DEBUG("%s: tensor %s keeps the %s layout\n", __func__, t->name, ggml_type_name(t->type));
+        memcpy(t->data, data, data_size);
+        return 0;
+    }
+};
+
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
@@ -4963,6 +5143,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for Q8_0
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
+
+    // instances for MS_C, one per bits per weight
+    static const ggml::cpu::repack::tensor_traits_ms_c ms_c_i16[6] = { 1, 2, 3, 4, 5, 6 };
 
     // instances for RISC-V
     //
@@ -5139,6 +5322,10 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             if (cur->ne[1] % 4 == 0) {
                 return &q1_0_4x4_q8_0;
             }
+        }
+    } else if (ggml_ms_c_bits(cur->type) > 0) {
+        if (ggml_cpu_has_avx2() && cur->ne[2] == 1 && cur->ne[3] == 1) {
+            return &ms_c_i16[ggml_ms_c_bits(cur->type) - 1];
         }
     }
 

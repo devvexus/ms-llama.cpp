@@ -91,6 +91,9 @@ static inline int ggml_ms_c_bits(enum ggml_type type) {
 // k bits per weight, same result as dequantize_row_ms_c<k>
 void ggml_ms_c_to_f32(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n);
 
+// v = weights / d, with one d per block
+void ggml_ms_c_to_i16(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n);
+
 // Generic implementation
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -132,6 +135,7 @@ void ggml_vec_dot_ms_c5_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 void ggml_vec_dot_ms_c6_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 void ggml_ms_c_to_f32_generic(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n);
+void ggml_ms_c_to_i16_generic(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n);
 
 #ifdef __cplusplus
 }

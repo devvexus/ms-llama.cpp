@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <cfloat>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
 
@@ -6403,5 +6404,300 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     ggml_gemm_q2_K_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 
 
+#endif
+}
+
+void ggml_ms_c_quantize_i16(const float * GGML_RESTRICT x, int16_t * GGML_RESTRICT q, float * GGML_RESTRICT s, int64_t n, int64_t ldq) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    const __m256 flt_max = _mm256_set1_ps(FLT_MAX);
+
+    int16_t tmp[QK_MS];
+
+    // same results as ggml_ms_c_quantize_i16_generic
+    for (int64_t b = 0; b < n/QK_MS; b++) {
+        const float * xb = x + b*QK_MS;
+
+        __m256 vmax = _mm256_setzero_ps();
+        __m256 bad  = _mm256_setzero_ps();
+        for (int j = 0; j < QK_MS; j += 8) {
+            const __m256 ax = _mm256_andnot_ps(sign, _mm256_loadu_ps(xb + j));
+            vmax = _mm256_max_ps(vmax, ax);
+            bad  = _mm256_or_ps(bad, _mm256_cmp_ps(ax, flt_max, _CMP_NLE_UQ));
+        }
+
+        if (_mm256_movemask_ps(bad) != 0) {
+            s[b*ldq] = NAN;
+            memset(tmp, 0, sizeof(tmp));
+        } else {
+            __m128 m = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+            m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+            m = _mm_max_ss(m, _mm_movehdup_ps(m));
+            const float amax = _mm_cvtss_f32(m);
+
+            s[b*ldq] = amax / GGML_MS_C_Q16_MAX;
+            const __m256 id = _mm256_set1_ps(amax > GGML_MS_C_Q16_MAX / FLT_MAX ? GGML_MS_C_Q16_MAX / amax : 0.0f);
+
+            for (int j = 0; j < QK_MS; j += 16) {
+                const __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + j + 0), id));
+                const __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + j + 8), id));
+                _mm256_storeu_si256((__m256i *) (tmp + j), _mm256_permute4x64_epi64(_mm256_packs_epi32(i0, i1), 0xD8));
+            }
+        }
+
+        int16_t * qb = q + b*(QK_MS/2)*ldq*2;
+        for (int p = 0; p < QK_MS/2; p++) {
+            memcpy(qb + p*ldq*2, tmp + 2*p, 2*sizeof(int16_t));
+        }
+    }
+#else
+    ggml_ms_c_quantize_i16_generic(x, q, s, n, ldq);
+#endif
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static inline __m512i ms_c_madd_i16_avx512(const __m512i acc, const __m512i a, const __m512i b) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpwssd_epi32(acc, a, b);
+#else
+    return _mm512_add_epi32(acc, _mm512_madd_epi16(a, b));
+#endif
+}
+
+// 8 rows x 32 columns, f has a row stride of 32
+static void ms_c_gemm_8x32_avx512(int64_t n, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d,
+                                  const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT f) {
+    const int64_t nb = n/QK_MS;
+
+    __m512 sum[8][2];
+    for (int r = 0; r < 8; r++) {
+        sum[r][0] = _mm512_setzero_ps();
+        sum[r][1] = _mm512_setzero_ps();
+    }
+
+    for (int64_t b = 0; b < nb; b++) {
+        const int16_t * vb = v + b*QK_MS;
+        const int16_t * qb = q + b*(QK_MS/2)*ldq*2;
+
+        __m512i acc[8][2];
+        for (int r = 0; r < 8; r++) {
+            acc[r][0] = _mm512_setzero_si512();
+            acc[r][1] = _mm512_setzero_si512();
+        }
+
+        for (int p = 0; p < QK_MS/2; p++) {
+            const __m512i a0 = _mm512_loadu_si512(qb + p*ldq*2);
+            const __m512i a1 = _mm512_loadu_si512(qb + p*ldq*2 + 32);
+            for (int r = 0; r < 8; r++) {
+                int32_t w;
+                memcpy(&w, vb + r*n + 2*p, sizeof(w));
+                const __m512i wv = _mm512_set1_epi32(w);
+                acc[r][0] = ms_c_madd_i16_avx512(acc[r][0], wv, a0);
+                acc[r][1] = ms_c_madd_i16_avx512(acc[r][1], wv, a1);
+            }
+        }
+
+        const __m512 s0 = _mm512_loadu_ps(s + b*ldq);
+        const __m512 s1 = _mm512_loadu_ps(s + b*ldq + 16);
+        for (int r = 0; r < 8; r++) {
+            const __m512 dr = _mm512_set1_ps(d[r*nb + b]);
+            sum[r][0] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[r][0]), _mm512_mul_ps(dr, s0), sum[r][0]);
+            sum[r][1] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[r][1]), _mm512_mul_ps(dr, s1), sum[r][1]);
+        }
+    }
+
+    for (int r = 0; r < 8; r++) {
+        _mm512_storeu_ps(f + 32*r,      sum[r][0]);
+        _mm512_storeu_ps(f + 32*r + 16, sum[r][1]);
+    }
+}
+
+// 8 rows x 16 columns, f has a row stride of 32
+static void ms_c_gemm_8x16_avx512(int64_t n, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d,
+                                  const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT f) {
+    const int64_t nb = n/QK_MS;
+
+    __m512 sum[8];
+    for (int r = 0; r < 8; r++) {
+        sum[r] = _mm512_setzero_ps();
+    }
+
+    for (int64_t b = 0; b < nb; b++) {
+        const int16_t * vb = v + b*QK_MS;
+        const int16_t * qb = q + b*(QK_MS/2)*ldq*2;
+
+        __m512i acc[8];
+        for (int r = 0; r < 8; r++) {
+            acc[r] = _mm512_setzero_si512();
+        }
+
+        for (int p = 0; p < QK_MS/2; p++) {
+            const __m512i a0 = _mm512_loadu_si512(qb + p*ldq*2);
+            for (int r = 0; r < 8; r++) {
+                int32_t w;
+                memcpy(&w, vb + r*n + 2*p, sizeof(w));
+                acc[r] = ms_c_madd_i16_avx512(acc[r], _mm512_set1_epi32(w), a0);
+            }
+        }
+
+        const __m512 s0 = _mm512_loadu_ps(s + b*ldq);
+        for (int r = 0; r < 8; r++) {
+            sum[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[r]), _mm512_mul_ps(_mm512_set1_ps(d[r*nb + b]), s0), sum[r]);
+        }
+    }
+
+    for (int r = 0; r < 8; r++) {
+        _mm512_storeu_ps(f + 32*r, sum[r]);
+    }
+}
+#elif defined(__AVX2__)
+// 4 rows x 24 columns, f has a row stride of 24
+static void ms_c_gemm_4x24_avx2(int64_t n, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d,
+                                const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT f) {
+    const int64_t nb = n/QK_MS;
+
+    __m256 sum[4][3];
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 3; c++) {
+            sum[r][c] = _mm256_setzero_ps();
+        }
+    }
+
+    for (int64_t b = 0; b < nb; b++) {
+        const int16_t * vb = v + b*QK_MS;
+        const int16_t * qb = q + b*(QK_MS/2)*ldq*2;
+
+        __m256i acc[4][3];
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 3; c++) {
+                acc[r][c] = _mm256_setzero_si256();
+            }
+        }
+
+        for (int p = 0; p < QK_MS/2; p++) {
+            const __m256i a0 = _mm256_loadu_si256((const __m256i *) (qb + p*ldq*2));
+            const __m256i a1 = _mm256_loadu_si256((const __m256i *) (qb + p*ldq*2 + 16));
+            const __m256i a2 = _mm256_loadu_si256((const __m256i *) (qb + p*ldq*2 + 32));
+            for (int r = 0; r < 4; r++) {
+                int32_t w;
+                memcpy(&w, vb + r*n + 2*p, sizeof(w));
+                const __m256i wv = _mm256_set1_epi32(w);
+                acc[r][0] = _mm256_add_epi32(acc[r][0], _mm256_madd_epi16(wv, a0));
+                acc[r][1] = _mm256_add_epi32(acc[r][1], _mm256_madd_epi16(wv, a1));
+                acc[r][2] = _mm256_add_epi32(acc[r][2], _mm256_madd_epi16(wv, a2));
+            }
+        }
+
+        for (int r = 0; r < 4; r++) {
+            const __m256 dr = _mm256_set1_ps(d[r*nb + b]);
+            for (int c = 0; c < 3; c++) {
+                const __m256 sc = _mm256_mul_ps(dr, _mm256_loadu_ps(s + b*ldq + 8*c));
+                sum[r][c] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[r][c]), sc, sum[r][c]);
+            }
+        }
+    }
+
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 3; c++) {
+            _mm256_storeu_ps(f + 24*r + 8*c, sum[r][c]);
+        }
+    }
+}
+
+// 4 rows x 8 columns, f has a row stride of 24
+static void ms_c_gemm_4x8_avx2(int64_t n, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d,
+                               const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT f) {
+    const int64_t nb = n/QK_MS;
+
+    __m256 sum[4];
+    for (int r = 0; r < 4; r++) {
+        sum[r] = _mm256_setzero_ps();
+    }
+
+    for (int64_t b = 0; b < nb; b++) {
+        const int16_t * vb = v + b*QK_MS;
+        const int16_t * qb = q + b*(QK_MS/2)*ldq*2;
+
+        __m256i acc[4];
+        for (int r = 0; r < 4; r++) {
+            acc[r] = _mm256_setzero_si256();
+        }
+
+        for (int p = 0; p < QK_MS/2; p++) {
+            const __m256i a0 = _mm256_loadu_si256((const __m256i *) (qb + p*ldq*2));
+            for (int r = 0; r < 4; r++) {
+                int32_t w;
+                memcpy(&w, vb + r*n + 2*p, sizeof(w));
+                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(_mm256_set1_epi32(w), a0));
+            }
+        }
+
+        const __m256 s0 = _mm256_loadu_ps(s + b*ldq);
+        for (int r = 0; r < 4; r++) {
+            sum[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[r]), _mm256_mul_ps(_mm256_set1_ps(d[r*nb + b]), s0), sum[r]);
+        }
+    }
+
+    for (int r = 0; r < 4; r++) {
+        _mm256_storeu_ps(f + 24*r, sum[r]);
+    }
+}
+#endif
+
+#if defined(__AVX2__)
+// dst is column major: dst[c*ldd + r]
+static inline void ms_c_store_tile(const float * GGML_RESTRICT f, int ldf, int nr, int nc, float * GGML_RESTRICT dst, int64_t ldd) {
+    for (int c = 0; c < nc; c++) {
+        for (int r = 0; r < nr; r++) {
+            dst[c*ldd + r] = f[r*ldf + c];
+        }
+    }
+}
+#endif
+
+void ggml_ms_c_gemm_i16(int64_t n, int nr, int nc, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d,
+                        const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT dst, int64_t ldd) {
+    assert(n % QK_MS == 0);
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const int64_t nb = n/QK_MS;
+
+    float f[8*32];
+
+    for (int c0 = 0; c0 < nc; c0 += 32) {
+        const int ncb = MIN(32, nc - c0);
+        for (int r0 = 0; r0 < nr; r0 += 8) {
+            if (ncb > 16) {
+                ms_c_gemm_8x32_avx512(n, v + r0*n, d + r0*nb, q + 2*c0, ldq, s + c0, f);
+            } else {
+                ms_c_gemm_8x16_avx512(n, v + r0*n, d + r0*nb, q + 2*c0, ldq, s + c0, f);
+            }
+            ms_c_store_tile(f, 32, MIN(8, nr - r0), ncb, dst + c0*ldd + r0, ldd);
+        }
+    }
+#elif defined(__AVX2__)
+    const int64_t nb = n/QK_MS;
+
+    float f[4*24];
+
+    int c0 = 0;
+    for (; nc - c0 > 16; c0 += 24) {
+        const int ncb = MIN(24, nc - c0);
+        for (int r0 = 0; r0 < nr; r0 += 4) {
+            ms_c_gemm_4x24_avx2(n, v + r0*n, d + r0*nb, q + 2*c0, ldq, s + c0, f);
+            ms_c_store_tile(f, 24, MIN(4, nr - r0), ncb, dst + c0*ldd + r0, ldd);
+        }
+    }
+    for (; c0 < nc; c0 += 8) {
+        const int ncb = MIN(8, nc - c0);
+        for (int r0 = 0; r0 < nr; r0 += 4) {
+            ms_c_gemm_4x8_avx2(n, v + r0*n, d + r0*nb, q + 2*c0, ldq, s + c0, f);
+            ms_c_store_tile(f, 24, MIN(4, nr - r0), ncb, dst + c0*ldd + r0, ldd);
+        }
+    }
+#else
+    ggml_ms_c_gemm_i16_generic(n, nr, nc, v, d, q, ldq, s, dst, ldd);
 #endif
 }
