@@ -138,6 +138,12 @@ struct block_mxfp4x8 {
 };
 static_assert(sizeof(block_mxfp4x8) == 8 + QK_MXFP4 * 4, "wrong mxfp4x8 block size/padding");
 
+// int16 MS_C GEMM: src1 is quantized to [-GGML_MS_C_Q16_MAX, GGML_MS_C_Q16_MAX] with one scale per QK_MS values, so a block sum of v*q fits in int32 (512*510*8191 < 2^31)
+#define GGML_MS_C_Q16_MAX 8191
+// ggml_ms_c_gemm_i16 reads v and d for nr rounded up to GGML_MS_C_ROWS_PAD rows, and q and s for nc rounded up to GGML_MS_C_COLS_PAD columns
+#define GGML_MS_C_ROWS_PAD 8
+#define GGML_MS_C_COLS_PAD 16
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -182,6 +188,11 @@ void ggml_gemm_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_gemm_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+// one src1 column: q[2*(p*ldq) + i] = value 2p+i, s[b*ldq] = scale of block b
+// a block with a NaN or inf gets q = 0 and s = NaN, so all results of that column are NaN
+void ggml_ms_c_quantize_i16(const float * GGML_RESTRICT x, int16_t * GGML_RESTRICT q, float * GGML_RESTRICT s, int64_t n, int64_t ldq);
+// dst[c*ldd + r] = sum over the blocks b of d[r][b] * s[b][c] * (v[r] . q[c] over block b), for r < nr and c < nc
+void ggml_ms_c_gemm_i16(int64_t n, int nr, int nc, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d, const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT dst, int64_t ldd);
 #if defined __riscv_zvfh
 void ggml_quantize_mat_q8_0_4x1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -238,6 +249,8 @@ void ggml_gemm_mxfp4_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
 void ggml_gemm_mxfp4_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_ms_c_quantize_i16_generic(const float * GGML_RESTRICT x, int16_t * GGML_RESTRICT q, float * GGML_RESTRICT s, int64_t n, int64_t ldq);
+void ggml_ms_c_gemm_i16_generic(int64_t n, int nr, int nc, const int16_t * GGML_RESTRICT v, const float * GGML_RESTRICT d, const int16_t * GGML_RESTRICT q, int64_t ldq, const float * GGML_RESTRICT s, float * GGML_RESTRICT dst, int64_t ldd);
 #if defined __riscv_zvfh
 void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
