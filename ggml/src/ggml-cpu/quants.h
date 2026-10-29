@@ -75,6 +75,22 @@ void ggml_vec_dot_ms_c4_f32(int n, float * GGML_RESTRICT s, size_t bs, const voi
 void ggml_vec_dot_ms_c5_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_ms_c6_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// bits per weight of an MS_C type, 0 for other types
+static inline int ggml_ms_c_bits(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_MS_C1: return 1;
+        case GGML_TYPE_MS_C2: return 2;
+        case GGML_TYPE_MS_C3: return 3;
+        case GGML_TYPE_MS_C4: return 4;
+        case GGML_TYPE_MS_C5: return 5;
+        case GGML_TYPE_MS_C6: return 6;
+        default:              return 0;
+    }
+}
+
+// k bits per weight, same result as dequantize_row_ms_c<k>
+void ggml_ms_c_to_f32(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n);
+
 // Generic implementation
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -114,6 +130,8 @@ void ggml_vec_dot_ms_c3_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 void ggml_vec_dot_ms_c4_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_ms_c5_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_ms_c6_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+void ggml_ms_c_to_f32_generic(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n);
 
 #ifdef __cplusplus
 }

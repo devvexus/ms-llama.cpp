@@ -1333,6 +1333,7 @@ static bool ggml_compute_forward_mul_mat_dequant(
     }
 
     ggml_to_float_t const to_float = ggml_get_type_traits(src0->type)->to_float;
+    const int ms_c_bits = ggml_ms_c_bits(src0->type);
     float * wdata = (float *) params->wdata;
 
     for (int64_t p0 = 0; p0 < ne01; p0 += np) {
@@ -1343,7 +1344,12 @@ static bool ggml_compute_forward_mul_mat_dequant(
         const int64_t ir1 = MIN(ir0 + dr, m);
 
         for (int64_t ir = ir0; ir < ir1; ir++) {
-            to_float((const char *) src0->data + (p0 + ir)*src0->nb[1], wdata + ir*ne00, ne00);
+            const void * row = (const char *) src0->data + (p0 + ir)*src0->nb[1];
+            if (ms_c_bits > 0) {
+                ggml_ms_c_to_f32(ms_c_bits, row, wdata + ir*ne00, ne00);
+            } else {
+                to_float(row, wdata + ir*ne00, ne00);
+            }
         }
 
         ggml_barrier(params->threadpool);

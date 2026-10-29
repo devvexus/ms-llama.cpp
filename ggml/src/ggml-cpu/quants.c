@@ -1413,3 +1413,15 @@ void ggml_vec_dot_ms_c6_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     UNUSED(bs);
     ggml_vec_dot_ms_c_f32((ggml_to_float_t) dequantize_row_ms_c6, sizeof(block_ms_c6), n, s, vx, vy);
 }
+
+void ggml_ms_c_to_f32_generic(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n) {
+    switch (k) {
+        case 1: dequantize_row_ms_c1(vx, y, n); break;
+        case 2: dequantize_row_ms_c2(vx, y, n); break;
+        case 3: dequantize_row_ms_c3(vx, y, n); break;
+        case 4: dequantize_row_ms_c4(vx, y, n); break;
+        case 5: dequantize_row_ms_c5(vx, y, n); break;
+        case 6: dequantize_row_ms_c6(vx, y, n); break;
+        default: GGML_ABORT("invalid MS_C bits");
+    }
+}
