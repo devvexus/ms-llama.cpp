@@ -2717,14 +2717,15 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
             ggml_tensor * table_ids = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, row_ids, ids), ids->ne[0]);
             return ggml_mul(ctx0, ggml_get_rows(ctx0, table, table_ids), ggml_get_rows(ctx0, mask, ids));
         };
-        ggml_tensor * hi = rows(tok_embd,      split->in_hidx, split->in_hmask);
-        ggml_tensor * lo = rows(split->tok_lo, split->in_lidx, split->in_lmask);
+        ggml_tensor * hi = rows(split->lookup_hi, split->in_hidx, split->in_hmask);
+        ggml_tensor * lo = rows(split->lookup_lo, split->in_lidx, split->in_lmask);
         return ggml_add(ctx0, hi, lo);
     };
 
     // the embeddings placeholders for the 3 paths
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
+    // (a split table can be read from the device copies of the output instead, see load_tensors_emb_split)
     {
         embd0 = lookup(inp->tokens);
         ggml_build_forward_order(gf, embd0);

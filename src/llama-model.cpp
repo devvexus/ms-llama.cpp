@@ -2456,7 +2456,7 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
-// the lookup tables go on the buffer type of token_embd, the logit permutation on the buffer type of the output
+// the lookup tables go on the buffer type of the tables they index, the logit permutation on the buffer type of the output
 void llama_model_base::load_tensors_emb_split() {
     auto & es = emb_split;
     if (es.n_hi == 0) {
@@ -2473,6 +2473,42 @@ void llama_model_base::load_tensors_emb_split() {
     // both output tables read the same transformed input
     if (const auto it = hdmd.rot.find(output); it != hdmd.rot.end()) {
         hdmd.rot.emplace(es.out_lo, it->second);
+    }
+
+    // the lookup of a split table takes several ops, reading the device copies of the tied output keeps them off the host
+    auto device_get_rows = [](ggml_tensor * table) {
+        if (table->buffer == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(table->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (ggml_backend_buft_is_host(buft) || dev == nullptr) {
+            return false;
+        }
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (!ctx) {
+            throw std::runtime_error("failed to create ggml context");
+        }
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+        return ggml_backend_dev_supports_op(dev, ggml_get_rows(ctx.get(), table, ids));
+    };
+    const bool out_on_device = device_get_rows(output) && device_get_rows(es.out_lo);
+    es.lookup_hi = out_on_device ? output    : tok_embd;
+    es.lookup_lo = out_on_device ? es.out_lo : es.tok_lo;
+
+    // the graph check finds the latent lookups by their table
+    if (out_on_device) {
+        if (const auto it = hdmd.inv.find(tok_embd); it != hdmd.inv.end()) {
+            hdmd.inv.emplace(output, it->second);
+        }
+        if (const auto it = hdmd.inv.find(es.tok_lo); it != hdmd.inv.end()) {
+            hdmd.inv.emplace(es.out_lo, it->second);
+        }
     }
 
     std::vector<int32_t> inv(n_vocab);
@@ -2544,7 +2580,7 @@ void llama_model_base::load_tensors_emb_split() {
         pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
     };
 
-    make(tok_embd, {
+    make(es.lookup_hi, {
         { &es.in_hidx,  "emb_split.hidx",  GGML_TYPE_I32, hidx.data()  },
         { &es.in_lidx,  "emb_split.lidx",  GGML_TYPE_I32, lidx.data()  },
         { &es.in_hmask, "emb_split.hmask", GGML_TYPE_F32, hmask.data() },

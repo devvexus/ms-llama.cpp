@@ -728,6 +728,10 @@ struct llama_emb_split {
     ggml_tensor * tok_lo = nullptr; // token_embd_lo for the lookup
     ggml_tensor * out_lo = nullptr; // token_embd_lo for the output head
 
+    // tables read by the lookup: the output head copies if they are in device memory, else tok_embd and tok_lo
+    ggml_tensor * lookup_hi = nullptr;
+    ggml_tensor * lookup_lo = nullptr;
+
     // per token: row in each table (0 in the table that does not hold it) and a 1/0 mask
     ggml_tensor * in_hidx  = nullptr;
     ggml_tensor * in_lidx  = nullptr;
