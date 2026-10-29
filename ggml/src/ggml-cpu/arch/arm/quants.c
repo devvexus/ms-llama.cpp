@@ -4354,7 +4354,7 @@ static inline int32x4_t ms_c_value4_neon(const uint32x4_t st) {
 }
 
 static inline uint32x4_t ms_c_state4_neon(const uint8x16_t p, const uint8x16_t idx, const int32x4_t shl) {
-    return vshrq_n_u32(vshlq_u32(vreinterpretq_u32_u8(vqtbl1q_u8(p, idx)), shl), 32 - GGML_MS_L);
+    return vshrq_n_u32(vshlq_u32(vreinterpretq_u32_u8(ggml_vqtbl1q_u8(p, idx)), shl), 32 - GGML_MS_L);
 }
 
 // sum over the block of value_i * y_i (without the scale d)
