@@ -1282,6 +1282,84 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+#if GGML_USE_LLAMAFILE
+// vec_dot of a quantized type with F32 vec_dot_type decodes src0 again for every src1 column: for larger batches decode src0 to F32 once and use the F32 sgemm
+static bool ggml_cpu_mul_mat_use_dequant(const struct ggml_tensor * src0, const struct ggml_tensor * src1) {
+#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__ARM_NEON) || defined(__VXE__) || defined(__VXE2__) || defined(__MMA__) || defined(__riscv_v_intrinsic)
+    return ggml_is_quantized(src0->type) &&
+           type_traits_cpu[src0->type].vec_dot_type == GGML_TYPE_F32 &&
+           ggml_get_type_traits(src0->type)->to_float != NULL &&
+           src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+           src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           src0->ne[0] > 0 && src0->ne[1] % 4 == 0 && src1->ne[1] >= 16;
+#else
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    return false;
+#endif
+}
+
+// src0 rows decoded per panel (about 32 MB of F32)
+static int64_t ggml_cpu_mul_mat_dequant_rows(const struct ggml_tensor * src0) {
+    const int64_t rows = MAX(16, (32*1024*1024 / (src0->ne[0]*(int64_t) sizeof(float))) / 16 * 16);
+    return MIN(rows, src0->ne[1]);
+}
+
+// returns false if sgemm declines; it then declines on the first panel, before dst is written
+static bool ggml_compute_forward_mul_mat_dequant(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne11 = src1->ne[1];
+
+    if (params->use_ref || !ggml_cpu_mul_mat_use_dequant(src0, src1)) {
+        return false;
+    }
+
+    const int64_t np = ggml_cpu_mul_mat_dequant_rows(src0);
+
+    if (params->wsize < (size_t) (np*ne00) * sizeof(float)) {
+        return false;
+    }
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(src0->type)->to_float;
+    float * wdata = (float *) params->wdata;
+
+    for (int64_t p0 = 0; p0 < ne01; p0 += np) {
+        const int64_t m = MIN(np, ne01 - p0);
+
+        const int64_t dr  = (m + params->nth - 1) / params->nth;
+        const int64_t ir0 = MIN(dr * params->ith, m);
+        const int64_t ir1 = MIN(ir0 + dr, m);
+
+        for (int64_t ir = ir0; ir < ir1; ir++) {
+            to_float((const char *) src0->data + (p0 + ir)*src0->nb[1], wdata + ir*ne00, ne00);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        if (!llamafile_sgemm(params, m, ne11, ne00,
+                             wdata, ne00,
+                             src1->data, src1->nb[1]/sizeof(float),
+                             (char *) dst->data + p0*sizeof(float), dst->nb[1]/sizeof(float),
+                             GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32)) {
+            GGML_ASSERT(p0 == 0);
+            return false;
+        }
+
+        // the next panel overwrites wdata
+        ggml_barrier(params->threadpool);
+    }
+
+    return true;
+}
+#endif
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1353,6 +1431,10 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 UseGgmlGemm1:;
+
+    if (ggml_compute_forward_mul_mat_dequant(params, dst)) {
+        return;
+    }
 #endif
 
     if (src1->type != vec_dot_type) {
@@ -2926,6 +3008,11 @@ struct ggml_cplan ggml_graph_plan(
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
+#if GGML_USE_LLAMAFILE
+                        if (ggml_cpu_mul_mat_use_dequant(node->src[0], node->src[1])) {
+                            cur = MAX(cur, (size_t) (ggml_cpu_mul_mat_dequant_rows(node->src[0]) * node->src[0]->ne[0]) * sizeof(float));
+                        }
+#endif
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
