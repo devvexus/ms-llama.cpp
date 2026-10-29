@@ -88,6 +88,20 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
+    } else if (tensor->type >= GGML_TYPE_MS_C1 && tensor->type <= GGML_TYPE_MS_C6) {
+        // no quantizer: random blocks with a fp16 scale
+        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        std::default_random_engine gen(std::random_device{}());
+        std::uniform_int_distribution<int> dist(0, 255);
+        for (uint8_t & q : dataq) {
+            q = dist(gen);
+        }
+        const size_t bs = ggml_type_size(tensor->type);
+        for (size_t i = 0; i < dataq.size()/bs; i++) {
+            const ggml_fp16_t d = ggml_fp32_to_fp16(data[i] / 256.0f);
+            memcpy(dataq.data() + i*bs, &d, sizeof(d));
+        }
+        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
     } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
         GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
 
@@ -10006,6 +10020,12 @@ static const ggml_type other_types[] = {
     GGML_TYPE_BF16,
 };
 
+// 512 values per block, not in the lists above as their tests use k = 256
+static const ggml_type ms_c_types[] = {
+    GGML_TYPE_MS_C1, GGML_TYPE_MS_C2, GGML_TYPE_MS_C3,
+    GGML_TYPE_MS_C4, GGML_TYPE_MS_C5, GGML_TYPE_MS_C6,
+};
+
 #ifdef _MSC_VER
 // Workaround long compile time with msvc
 #pragma optimize("", off)
@@ -10201,6 +10221,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+    for (ggml_type type : ms_c_types) {
+        for (int b : {1, 7}) {
+            for (bool v : {false, true}) {
+                for (bool vs0 : {false, true}) {
+                    test_cases.emplace_back(new test_get_rows(type, 512, 5, 4, b, 1, v, vs0));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_get_rows(type, 3584, 50, 20, 1, 1, false));
     }
     for (int b : {1, 7}) {
         for (bool v : {false, true}) {
@@ -11156,6 +11186,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
     }
 
+    for (ggml_type type_a : ms_c_types) {
+        for (int i = 1; i < 10; ++i) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, i, 512, {1, 1}, {1, 1}));
+        }
+        for (int n : {1, 2, 5, 8, 16, 33}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 3584, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16,  1, 16*512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16,  8, 16*512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16,  4, 1024, {3, 2}, {2, 2}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 16, 1024, {3, 2}, {2, 2}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16,  1, 512, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 16, 512, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+    }
+
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {
@@ -11512,6 +11557,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+    }
+
+    for (ggml_type type_a : ms_c_types) {
+        for (bool b : {false, true}) {
+            for (int n : {1, 4, 5, 8, 17, 32}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, b, 64, n, 1024));
+            }
+        }
+        for (int n : {3, 17}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64, n, 1536, 80));
+        }
     }
 
     // Test IQP panel path for all grid IQ types
@@ -12380,6 +12436,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    for (ggml_type type : ms_c_types) {
+        for (bool use_id : {false, true}) {
+            for (bool with_bias : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 32, 512,
+                    use_id, 16, 8, false, with_bias, true, false, {1, 1}));
+            }
+        }
     }
 
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
