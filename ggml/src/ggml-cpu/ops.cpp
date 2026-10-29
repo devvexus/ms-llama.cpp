@@ -699,6 +699,12 @@ void ggml_compute_forward_add(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
             {
                 ggml_compute_forward_add_q_f32(params, dst);
             } break;
@@ -1157,6 +1163,12 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
             {
                 ggml_compute_forward_add1_q_f32(params, dst);
             } break;
@@ -1289,6 +1301,12 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
         default:
             {
                 GGML_ABORT("fatal error");
@@ -4841,6 +4859,12 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
             {
                 ggml_compute_forward_out_prod_q_f32(params, dst);
             } break;
@@ -5167,6 +5191,12 @@ void ggml_compute_forward_set(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
         default:
             {
                 GGML_ABORT("fatal error");
@@ -5397,6 +5427,12 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -6158,6 +6194,12 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_MS_C1:
+        case GGML_TYPE_MS_C2:
+        case GGML_TYPE_MS_C3:
+        case GGML_TYPE_MS_C4:
+        case GGML_TYPE_MS_C5:
+        case GGML_TYPE_MS_C6:
         case GGML_TYPE_Q8_K:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:

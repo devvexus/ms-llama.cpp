@@ -4170,3 +4170,243 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+#if defined(__AVX2__)
+static inline uint64_t ms_c_bswap64(uint64_t v) {
+#if defined(_MSC_VER)
+    return _byteswap_uint64(v);
+#else
+    return __builtin_bswap64(v);
+#endif
+}
+
+// v = (sum of the 4 bytes of A*s + B) - 510 for 8 states
+static inline __m256i ms_c_value_avx2(const __m256i st) {
+    const __m256i x = _mm256_add_epi32(_mm256_mullo_epi32(st, _mm256_set1_epi32((int) GGML_MS_C_A)), _mm256_set1_epi32((int) GGML_MS_C_B));
+    const __m256i b = _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_set1_epi8(1)), _mm256_set1_epi16(1));
+    return _mm256_sub_epi32(b, _mm256_set1_epi32(510));
+}
+
+// values of weights 8g .. 8g+7 of a block: the 8 state windows (14 + 7k bits) come from one 64-bit word
+// for the groups that start inside s0 (8gk < 14), the word is made from s0 and the first stream bits
+static inline __m256i ms_c_group_avx2(const int k, const uint8_t * GGML_RESTRICT qs, uint32_t s0, int g) {
+    const int p = 8*g*k;
+    uint64_t w;
+    int off;
+    if (p < GGML_MS_L) {
+        uint64_t q;
+        memcpy(&q, qs, 8);
+        w = ((uint64_t) (s0 & ((1u << (GGML_MS_L - p)) - 1u)) << (64 - GGML_MS_L + p)) | (ms_c_bswap64(q) >> (GGML_MS_L - p));
+        off = 0;
+    } else {
+        const int q0 = p - GGML_MS_L;
+        int start = q0 >> 3;
+        if (start > 64*k - 8) {
+            start = 64*k - 8;
+        }
+        off = q0 - 8*start;
+        uint64_t q;
+        memcpy(&q, qs + start, 8);
+        w = ms_c_bswap64(q);
+    }
+    const __m256i vw    = _mm256_set1_epi64x((long long) w);
+    const __m256i base  = _mm256_set1_epi64x(64 - GGML_MS_L - off);
+    const __m256i ka    = _mm256_set_epi64x(3*k, 2*k, 1*k, 0);
+    const __m256i kb    = _mm256_set_epi64x(7*k, 6*k, 5*k, 4*k);
+    const __m256i vmask = _mm256_set1_epi64x(GGML_MS_STATE_MASK);
+    const __m256i a = _mm256_and_si256(_mm256_srlv_epi64(vw, _mm256_sub_epi64(base, ka)), vmask);
+    const __m256i b = _mm256_and_si256(_mm256_srlv_epi64(vw, _mm256_sub_epi64(base, kb)), vmask);
+    const __m256i pidx = _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
+    const __m256i st = _mm256_permute2x128_si256(_mm256_permutevar8x32_epi32(a, pidx), _mm256_permutevar8x32_epi32(b, pidx), 0x20);
+    return ms_c_value_avx2(st);
+}
+
+// same result as ms_c_group_avx2 for k <= 4, for groups away from s0 and the block end
+// the first window starts at bit 2 of byte gk - 2, so 32-bit words with fixed shifts are enough
+static inline __m256i ms_c_group_fast_avx2(const int k, const uint8_t * GGML_RESTRICT qs, int g) {
+    const __m256i bswap_bcast = _mm256_setr_epi8(3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0);
+    __m256i vw;
+    __m256i sh;
+    if (k <= 2) {
+        uint32_t wa;
+        memcpy(&wa, qs + (g*k - 2), 4);
+        vw = _mm256_shuffle_epi8(_mm256_set1_epi32((int) wa), bswap_bcast);
+        sh = k == 1 ? _mm256_setr_epi32(16, 15, 14, 13, 12, 11, 10, 9) : _mm256_setr_epi32(16, 14, 12, 10, 8, 6, 4, 2);
+    } else {
+        // k = 3, 4: the upper 4 lanes use the word at byte gk - 1 (k = 3) or gk (k = 4)
+        const __m128i la = _mm_castps_si128(_mm_load_ss((const float *) (qs + (g*k - 2))));
+        const __m128i lb = _mm_castps_si128(_mm_load_ss((const float *) (qs + (k == 3 ? g*k - 1 : g*k))));
+        vw = _mm256_shuffle_epi8(_mm256_inserti128_si256(_mm256_castsi128_si256(la), lb, 1), bswap_bcast);
+        sh = k == 3 ? _mm256_setr_epi32(16, 13, 10, 7, 12, 9, 6, 3) : _mm256_setr_epi32(16, 12, 8, 4, 16, 12, 8, 4);
+    }
+    const __m256i st = _mm256_and_si256(_mm256_srlv_epi32(vw, sh), _mm256_set1_epi32(GGML_MS_STATE_MASK));
+    return ms_c_value_avx2(st);
+}
+
+// acc + d * sum_i v_i * y_i over one block
+static inline __m256 ms_c_block_dot_avx2(const int k, const uint8_t * GGML_RESTRICT qs, uint32_t s0, float d, const float * GGML_RESTRICT y, __m256 acc) {
+    // groups first .. last take the 32-bit path; k >= 5 windows do not fit in 32 bits
+    const int first = k >= 5 ? QK_MS/8 : (k == 1 ? 2 : 1);
+    const int last  = k == 1 ? QK_MS/8 - 2 : QK_MS/8 - 1;
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    int g = 0;
+    for (; g < first; ++g) {
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ms_c_group_avx2(k, qs, s0, g)), _mm256_loadu_ps(y + 8*g), acc0);
+    }
+    for (; g + 3 <= last; g += 4) {
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ms_c_group_fast_avx2(k, qs, g + 0)), _mm256_loadu_ps(y + 8*(g + 0)), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ms_c_group_fast_avx2(k, qs, g + 1)), _mm256_loadu_ps(y + 8*(g + 1)), acc1);
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ms_c_group_fast_avx2(k, qs, g + 2)), _mm256_loadu_ps(y + 8*(g + 2)), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ms_c_group_fast_avx2(k, qs, g + 3)), _mm256_loadu_ps(y + 8*(g + 3)), acc1);
+    }
+    for (; g <= last; ++g) {
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ms_c_group_fast_avx2(k, qs, g)), _mm256_loadu_ps(y + 8*g), acc0);
+    }
+    for (; g < QK_MS/8; ++g) {
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ms_c_group_avx2(k, qs, s0, g)), _mm256_loadu_ps(y + 8*g), acc1);
+    }
+
+    return _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_add_ps(acc0, acc1), acc);
+}
+#endif
+
+void ggml_vec_dot_ms_c1_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ms_c1 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < n / QK_MS; i++) {
+        acc = ms_c_block_dot_avx2(1, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, GGML_CPU_FP16_TO_FP32(x[i].d), y + i*QK_MS, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_ms_c1_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c2_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ms_c2 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < n / QK_MS; i++) {
+        acc = ms_c_block_dot_avx2(2, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, GGML_CPU_FP16_TO_FP32(x[i].d), y + i*QK_MS, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_ms_c2_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ms_c3 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < n / QK_MS; i++) {
+        acc = ms_c_block_dot_avx2(3, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, GGML_CPU_FP16_TO_FP32(x[i].d), y + i*QK_MS, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_ms_c3_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c4_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ms_c4 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < n / QK_MS; i++) {
+        acc = ms_c_block_dot_avx2(4, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, GGML_CPU_FP16_TO_FP32(x[i].d), y + i*QK_MS, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_ms_c4_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c5_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ms_c5 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < n / QK_MS; i++) {
+        acc = ms_c_block_dot_avx2(5, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, GGML_CPU_FP16_TO_FP32(x[i].d), y + i*QK_MS, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_ms_c5_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_ms_c6_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK_MS == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ms_c6 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < n / QK_MS; i++) {
+        acc = ms_c_block_dot_avx2(6, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, GGML_CPU_FP16_TO_FP32(x[i].d), y + i*QK_MS, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_ms_c6_f32_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}

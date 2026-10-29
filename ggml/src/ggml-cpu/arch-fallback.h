@@ -34,6 +34,12 @@
 #define ggml_vec_dot_iq1_m_q8_K_generic ggml_vec_dot_iq1_m_q8_K
 #define ggml_vec_dot_iq4_nl_q8_0_generic ggml_vec_dot_iq4_nl_q8_0
 #define ggml_vec_dot_iq4_xs_q8_K_generic ggml_vec_dot_iq4_xs_q8_K
+#define ggml_vec_dot_ms_c1_f32_generic ggml_vec_dot_ms_c1_f32
+#define ggml_vec_dot_ms_c2_f32_generic ggml_vec_dot_ms_c2_f32
+#define ggml_vec_dot_ms_c3_f32_generic ggml_vec_dot_ms_c3_f32
+#define ggml_vec_dot_ms_c4_f32_generic ggml_vec_dot_ms_c4_f32
+#define ggml_vec_dot_ms_c5_f32_generic ggml_vec_dot_ms_c5_f32
+#define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -76,6 +82,13 @@
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC)
+// quants.c
+#define ggml_vec_dot_ms_c1_f32_generic ggml_vec_dot_ms_c1_f32
+#define ggml_vec_dot_ms_c2_f32_generic ggml_vec_dot_ms_c2_f32
+#define ggml_vec_dot_ms_c3_f32_generic ggml_vec_dot_ms_c3_f32
+#define ggml_vec_dot_ms_c4_f32_generic ggml_vec_dot_ms_c4_f32
+#define ggml_vec_dot_ms_c5_f32_generic ggml_vec_dot_ms_c5_f32
+#define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 // repack.cpp
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
 #define ggml_quantize_mat_q8_K_4x8_generic ggml_quantize_mat_q8_K_4x8
@@ -125,6 +138,12 @@
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_iq1_m_q8_K_generic ggml_vec_dot_iq1_m_q8_K
+#define ggml_vec_dot_ms_c1_f32_generic ggml_vec_dot_ms_c1_f32
+#define ggml_vec_dot_ms_c2_f32_generic ggml_vec_dot_ms_c2_f32
+#define ggml_vec_dot_ms_c3_f32_generic ggml_vec_dot_ms_c3_f32
+#define ggml_vec_dot_ms_c4_f32_generic ggml_vec_dot_ms_c4_f32
+#define ggml_vec_dot_ms_c5_f32_generic ggml_vec_dot_ms_c5_f32
+#define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -176,6 +195,12 @@
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
 #define ggml_vec_dot_q1_0_q8_0_generic ggml_vec_dot_q1_0_q8_0
 #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
+#define ggml_vec_dot_ms_c1_f32_generic ggml_vec_dot_ms_c1_f32
+#define ggml_vec_dot_ms_c2_f32_generic ggml_vec_dot_ms_c2_f32
+#define ggml_vec_dot_ms_c3_f32_generic ggml_vec_dot_ms_c3_f32
+#define ggml_vec_dot_ms_c4_f32_generic ggml_vec_dot_ms_c4_f32
+#define ggml_vec_dot_ms_c5_f32_generic ggml_vec_dot_ms_c5_f32
+#define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -221,6 +246,12 @@
 // quants.c
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
 #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
+#define ggml_vec_dot_ms_c1_f32_generic ggml_vec_dot_ms_c1_f32
+#define ggml_vec_dot_ms_c2_f32_generic ggml_vec_dot_ms_c2_f32
+#define ggml_vec_dot_ms_c3_f32_generic ggml_vec_dot_ms_c3_f32
+#define ggml_vec_dot_ms_c4_f32_generic ggml_vec_dot_ms_c4_f32
+#define ggml_vec_dot_ms_c5_f32_generic ggml_vec_dot_ms_c5_f32
+#define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x1_generic ggml_quantize_mat_q8_0_4x1
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
@@ -276,6 +307,12 @@
 #define ggml_vec_dot_iq3_s_q8_K_generic ggml_vec_dot_iq3_s_q8_K
 #define ggml_vec_dot_iq1_s_q8_K_generic ggml_vec_dot_iq1_s_q8_K
 #define ggml_vec_dot_iq1_m_q8_K_generic ggml_vec_dot_iq1_m_q8_K
+#define ggml_vec_dot_ms_c1_f32_generic ggml_vec_dot_ms_c1_f32
+#define ggml_vec_dot_ms_c2_f32_generic ggml_vec_dot_ms_c2_f32
+#define ggml_vec_dot_ms_c3_f32_generic ggml_vec_dot_ms_c3_f32
+#define ggml_vec_dot_ms_c4_f32_generic ggml_vec_dot_ms_c4_f32
+#define ggml_vec_dot_ms_c5_f32_generic ggml_vec_dot_ms_c5_f32
+#define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
@@ -331,6 +368,12 @@
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
 #define ggml_vec_dot_q1_0_q8_0_generic ggml_vec_dot_q1_0_q8_0
 #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
+#define ggml_vec_dot_ms_c1_f32_generic ggml_vec_dot_ms_c1_f32
+#define ggml_vec_dot_ms_c2_f32_generic ggml_vec_dot_ms_c2_f32
+#define ggml_vec_dot_ms_c3_f32_generic ggml_vec_dot_ms_c3_f32
+#define ggml_vec_dot_ms_c4_f32_generic ggml_vec_dot_ms_c4_f32
+#define ggml_vec_dot_ms_c5_f32_generic ggml_vec_dot_ms_c5_f32
+#define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
