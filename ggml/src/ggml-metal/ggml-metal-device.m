@@ -1517,7 +1517,13 @@ static bool ggml_metal_supports_mul_mat_op(
         bool mm_path) {
     if (!has_simdgroup_reduction ||
         op->src[0]->type == GGML_TYPE_NVFP4 ||
-        op->src[0]->type == GGML_TYPE_TQ1_0) {
+        op->src[0]->type == GGML_TYPE_TQ1_0 ||
+        op->src[0]->type == GGML_TYPE_MS_C1 ||
+        op->src[0]->type == GGML_TYPE_MS_C2 ||
+        op->src[0]->type == GGML_TYPE_MS_C3 ||
+        op->src[0]->type == GGML_TYPE_MS_C4 ||
+        op->src[0]->type == GGML_TYPE_MS_C5 ||
+        op->src[0]->type == GGML_TYPE_MS_C6) {
         return false;
     }
 
@@ -1933,7 +1939,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_GET_ROWS:
             return op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[0]->type != GGML_TYPE_TQ1_0;
+                   op->src[0]->type != GGML_TYPE_TQ1_0 &&
+                   op->src[0]->type != GGML_TYPE_MS_C1 &&
+                   op->src[0]->type != GGML_TYPE_MS_C2 &&
+                   op->src[0]->type != GGML_TYPE_MS_C3 &&
+                   op->src[0]->type != GGML_TYPE_MS_C4 &&
+                   op->src[0]->type != GGML_TYPE_MS_C5 &&
+                   op->src[0]->type != GGML_TYPE_MS_C6;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

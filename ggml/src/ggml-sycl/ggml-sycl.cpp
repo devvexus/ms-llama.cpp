@@ -7299,7 +7299,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     return false;
                 }
 
-                if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0) {
+                if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0 ||
+                    src0_type == GGML_TYPE_MS_C1 || src0_type == GGML_TYPE_MS_C2 || src0_type == GGML_TYPE_MS_C3 ||
+                    src0_type == GGML_TYPE_MS_C4 || src0_type == GGML_TYPE_MS_C5 || src0_type == GGML_TYPE_MS_C6) {
                     return false;
                 }
 
