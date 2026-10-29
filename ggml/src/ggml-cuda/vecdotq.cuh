@@ -1441,3 +1441,87 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+#define VDR_MS_C_Q8_1_MMVQ 1
+
+// MS_C value: v = (sum of the 4 unsigned bytes of x) - 510, x = GGML_MS_C_A*s + GGML_MS_C_B.
+// ms_c_dp4a adds the bytes of x times the bytes of y to c, add ms_c_dp4a_bias*sum(y) to get v times y.
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+static constexpr int ms_c_dp4a_bias = -510;
+
+static __device__ __forceinline__ int ms_c_dp4a(const uint32_t x, const int y, const int c) {
+    return __builtin_amdgcn_sudot4(false, (int) x, true, y, c, false);
+}
+#elif !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
+static constexpr int ms_c_dp4a_bias = -510;
+
+static __device__ __forceinline__ int ms_c_dp4a(const uint32_t x, const int y, const int c) {
+    int r;
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(x), "r"(y), "r"(c));
+    return r;
+}
+#else
+// signed x signed dp4a: the bytes of x are offset by -128, so the -510 becomes +2
+static constexpr int ms_c_dp4a_bias = 2;
+
+static __device__ __forceinline__ int ms_c_dp4a(const uint32_t x, const int y, const int c) {
+    return ggml_cuda_dp4a((int) (x ^ 0x80808080), y, c);
+}
+#endif
+
+static __device__ __forceinline__ uint32_t ms_c_bswap(const uint32_t x) {
+#if defined(GGML_USE_HIP)
+    return ggml_hip_perm(0, x, 0x00010203);
+#else
+    return __byte_perm(x, 0, 0x0123);
+#endif // defined(GGML_USE_HIP)
+}
+
+// byte i of x in all 4 bytes
+static __device__ __forceinline__ int ms_c_bcast(const int x, const int i) {
+#if defined(GGML_USE_HIP)
+    return ggml_hip_perm(0, x, 0x01010101*i);
+#else
+    return __byte_perm(x, 0, 0x1111*i);
+#endif // defined(GGML_USE_HIP)
+}
+
+// 32 weights (iqs = 0..15) of an MS_C block times q8_1 block iqs.
+// The 14 state bits before the 32 weights are in the previous code word (or s0), so the calls are independent.
+template <typename block_t>
+static __device__ __forceinline__ float vec_dot_ms_c_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    constexpr int k = 8*sizeof(block_t::qs)/QK_MS; // bits per weight
+
+    const block_t    * bq  = (const block_t *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+
+    // code bits MSB first, the window of state j starts at bit 18 + k*j
+    uint32_t w[k + 1];
+    w[0] = iqs == 0 ? bq->s0 : ms_c_bswap(get_int_b4(bq->qs, k*iqs - 1));
+#pragma unroll
+    for (int i = 0; i < k; ++i) {
+        w[i + 1] = ms_c_bswap(get_int_b4(bq->qs, k*iqs + i));
+    }
+
+    // exact sum of the q8_1 values, ds.y is not precise enough for the bias
+    int u[QI8_1];
+    int sumq = 0;
+#pragma unroll
+    for (int i = 0; i < QI8_1; ++i) {
+        u[i] = get_int_b4(bq8->qs, i);
+        sumq = ggml_cuda_dp4a(0x01010101, u[i], sumq);
+    }
+
+    int sumi = ms_c_dp4a_bias*sumq;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int      b  = 18 + k*j;
+        const uint64_t ww = ((uint64_t) w[b/32] << 32) | w[min(b/32 + 1, k)];
+        const uint32_t s  = (ww >> (50 - b%32)) & GGML_MS_STATE_MASK;
+        sumi = ms_c_dp4a(GGML_MS_C_A*s + GGML_MS_C_B, ms_c_bcast(u[j/4], j%4), sumi);
+    }
+
+    return __half2float(bq->d) * __low2float(bq8->ds) * sumi;
+}

@@ -119,6 +119,38 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// state i of an MS_C block: the 14 bits at bit k*i of [s0 (14 bits)][qs], MSB first
+template <typename block_t>
+static __device__ __forceinline__ uint32_t ms_c_state(const block_t * x, const int i) {
+    constexpr int k = 8*sizeof(block_t::qs)/QK_MS;
+
+    const int p = k*i - GGML_MS_L; // first qs bit of the window
+    if (p < 0) {
+        return ((x->s0 << (k*i)) | (((x->qs[0] << 8) | x->qs[1]) >> (16 - k*i))) & GGML_MS_STATE_MASK;
+    }
+
+    // do not read past the last byte of the window, it can be the last byte of the block
+    const int first = p/8;
+    const int last  = (p + GGML_MS_L - 1)/8;
+    const uint32_t v = (x->qs[first] << 16) | (x->qs[min(first + 1, last)] << 8) | x->qs[min(first + 2, last)];
+    return (v >> (24 - GGML_MS_L - p%8)) & GGML_MS_STATE_MASK;
+}
+
+static __device__ __forceinline__ int ms_c_value(const uint32_t s) {
+    const uint32_t x = GGML_MS_C_A*s + GGML_MS_C_B;
+    return (int) ((x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + (x >> 24)) - 510;
+}
+
+template <typename block_t>
+static __device__ __forceinline__ void dequantize_ms_c(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_t * x = (const block_t *) vx + ib;
+
+    const float d = x->d;
+
+    v.x = ms_c_value(ms_c_state(x, iqs + 0)) * d;
+    v.y = ms_c_value(ms_c_state(x, iqs + 1)) * d;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

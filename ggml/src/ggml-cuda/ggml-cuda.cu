@@ -5772,6 +5772,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ3_XXS:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_MS_C1:
+                    case GGML_TYPE_MS_C2:
+                    case GGML_TYPE_MS_C3:
+                    case GGML_TYPE_MS_C4:
+                    case GGML_TYPE_MS_C5:
+                    case GGML_TYPE_MS_C6:
                     case GGML_TYPE_BF16:
                         return true;
                     default:
@@ -5807,6 +5813,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_MS_C1:
+                    case GGML_TYPE_MS_C2:
+                    case GGML_TYPE_MS_C3:
+                    case GGML_TYPE_MS_C4:
+                    case GGML_TYPE_MS_C5:
+                    case GGML_TYPE_MS_C6:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:

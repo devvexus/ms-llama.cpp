@@ -1165,6 +1165,54 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int bs = sizeof(block_iq3_s);
 };
 
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MS_C1> {
+    static constexpr int qk = QK_MS;
+    static constexpr int qr = QR_MS_C;
+    static constexpr int qi = QI_MS_C;
+    static constexpr int bs = sizeof(block_ms_c1);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MS_C2> {
+    static constexpr int qk = QK_MS;
+    static constexpr int qr = QR_MS_C;
+    static constexpr int qi = QI_MS_C;
+    static constexpr int bs = sizeof(block_ms_c2);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MS_C3> {
+    static constexpr int qk = QK_MS;
+    static constexpr int qr = QR_MS_C;
+    static constexpr int qi = QI_MS_C;
+    static constexpr int bs = sizeof(block_ms_c3);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MS_C4> {
+    static constexpr int qk = QK_MS;
+    static constexpr int qr = QR_MS_C;
+    static constexpr int qi = QI_MS_C;
+    static constexpr int bs = sizeof(block_ms_c4);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MS_C5> {
+    static constexpr int qk = QK_MS;
+    static constexpr int qr = QR_MS_C;
+    static constexpr int qi = QI_MS_C;
+    static constexpr int bs = sizeof(block_ms_c5);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MS_C6> {
+    static constexpr int qk = QK_MS;
+    static constexpr int qr = QR_MS_C;
+    static constexpr int qi = QI_MS_C;
+    static constexpr int bs = sizeof(block_ms_c6);
+};
+
 //////////////////////
 
 struct ggml_cuda_device_info {
