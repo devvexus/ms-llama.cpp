@@ -4402,7 +4402,83 @@ static inline float ms_c_block_dot_neon(const int k, const uint8_t * GGML_RESTRI
     return vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])));
 }
 
-#define GGML_MS_C_VEC_DOT_NEON(K)                                                                                       \
+// the 512 values of one block (without the scale d)
+static inline void ms_c_block_to_i16_neon(const int k, const uint8_t * GGML_RESTRICT qs, const uint32_t s0, int16_t * GGML_RESTRICT v) {
+    const uint8x16_t i0 = vld1q_u8(ms_c_tbl[k - 1] +  0);
+    const uint8x16_t i1 = vld1q_u8(ms_c_tbl[k - 1] + 16);
+    const uint8x16_t i2 = vld1q_u8(ms_c_tbl[k - 1] + 32);
+    const uint8x16_t i3 = vld1q_u8(ms_c_tbl[k - 1] + 48);
+    const int32x4_t  h0 = vld1q_s32(ms_c_shl[k - 1] +  0);
+    const int32x4_t  h1 = vld1q_s32(ms_c_shl[k - 1] +  4);
+    const int32x4_t  h2 = vld1q_s32(ms_c_shl[k - 1] +  8);
+    const int32x4_t  h3 = vld1q_s32(ms_c_shl[k - 1] + 12);
+
+    const int nq = QK_MS*k/8;
+    const int gt = k == 1 ? 26 : k == 2 ? 29 : k == 3 ? 30 : 31;
+    uint8_t head[16];
+    uint8_t tail[32] = { 0 };
+    head[0] = (uint8_t) (s0 >> 8);
+    head[1] = (uint8_t) s0;
+    memcpy(head + 2, qs, 14);
+    memcpy(tail, qs + 2*k*gt - 2, nq + 2 - 2*k*gt);
+
+#define GGML_MS_C_GROUP_I16_NEON(P, G)                                                                                  \
+    do {                                                                                                                \
+        const uint8x16_t b  = vld1q_u8(P);                                                                              \
+        const int32x4_t  v0 = ms_c_value4_neon(ms_c_state4_neon(b, i0, h0));                                            \
+        const int32x4_t  v1 = ms_c_value4_neon(ms_c_state4_neon(b, i1, h1));                                            \
+        const int32x4_t  v2 = ms_c_value4_neon(ms_c_state4_neon(b, i2, h2));                                            \
+        const int32x4_t  v3 = ms_c_value4_neon(ms_c_state4_neon(b, i3, h3));                                            \
+        vst1q_s16(v + 16*(G) + 0, vcombine_s16(vmovn_s32(v0), vmovn_s32(v1)));                                          \
+        vst1q_s16(v + 16*(G) + 8, vcombine_s16(vmovn_s32(v2), vmovn_s32(v3)));                                          \
+    } while (0)
+
+    GGML_MS_C_GROUP_I16_NEON(head, 0);
+    for (int g = 1; g < gt; ++g) {
+        GGML_MS_C_GROUP_I16_NEON(qs + 2*k*g - 2, g);
+    }
+    for (int g = gt; g < QK_MS/16; ++g) {
+        GGML_MS_C_GROUP_I16_NEON(tail + 2*k*(g - gt), g);
+    }
+#undef GGML_MS_C_GROUP_I16_NEON
+}
+
+static inline void ms_c_row_to_i16_neon(const int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n) {
+    // all MS_C blocks are {ggml_half d, uint16_t s0, uint8_t qs[k*QK_MS/8]}
+    const size_t bs = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8;
+    for (int64_t i = 0; i < n/QK_MS; i++) {
+        const uint8_t * x = (const uint8_t *) vx + i*bs;
+        ggml_half dh;
+        uint16_t  s0;
+        memcpy(&dh, x, sizeof(dh));
+        memcpy(&s0, x + sizeof(dh), sizeof(s0));
+        d[i] = GGML_CPU_FP16_TO_FP32(dh);
+        ms_c_block_to_i16_neon(k, x + sizeof(dh) + sizeof(s0), s0 & GGML_MS_STATE_MASK, v + i*QK_MS);
+    }
+}
+
+static inline void ms_c_row_to_f32_neon(const int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n) {
+    const size_t bs = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8;
+    int16_t v[QK_MS];
+    for (int64_t i = 0; i < n/QK_MS; i++) {
+        const uint8_t * x = (const uint8_t *) vx + i*bs;
+        ggml_half dh;
+        uint16_t  s0;
+        memcpy(&dh, x, sizeof(dh));
+        memcpy(&s0, x + sizeof(dh), sizeof(s0));
+        ms_c_block_to_i16_neon(k, x + sizeof(dh) + sizeof(s0), s0 & GGML_MS_STATE_MASK, v);
+        // value * d, as dequantize_row_ms_c
+        const float32x4_t dv = vdupq_n_f32(GGML_CPU_FP16_TO_FP32(dh));
+        float * yb = y + i*QK_MS;
+        for (int j = 0; j < QK_MS; j += 8) {
+            const int16x8_t w = vld1q_s16(v + j);
+            vst1q_f32(yb + j + 0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))),  dv));
+            vst1q_f32(yb + j + 4, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))), dv));
+        }
+    }
+}
+
+#define GGML_MS_C_VEC_DOT_NEON(K)                                                                                     \
     const block_ms_c##K * GGML_RESTRICT x = vx;                                                                         \
     const float * GGML_RESTRICT y = vy;                                                                                 \
     float sumf = 0.0f;                                                                                                  \
@@ -4497,3 +4573,37 @@ void ggml_vec_dot_ms_c6_f32(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+
+void ggml_ms_c_to_f32(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n) {
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    switch (k) {
+        case 1: ms_c_row_to_f32_neon(1, vx, y, n); break;
+        case 2: ms_c_row_to_f32_neon(2, vx, y, n); break;
+        case 3: ms_c_row_to_f32_neon(3, vx, y, n); break;
+        case 4: ms_c_row_to_f32_neon(4, vx, y, n); break;
+        case 5: ms_c_row_to_f32_neon(5, vx, y, n); break;
+        case 6: ms_c_row_to_f32_neon(6, vx, y, n); break;
+        default: GGML_ABORT("invalid MS_C bits");
+    }
+#else
+    ggml_ms_c_to_f32_generic(k, vx, y, n);
+#endif
+}
+
+void ggml_ms_c_to_i16(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n) {
+    assert(n % QK_MS == 0);
+#if defined(__ARM_NEON)
+    switch (k) {
+        case 1: ms_c_row_to_i16_neon(1, vx, v, d, n); break;
+        case 2: ms_c_row_to_i16_neon(2, vx, v, d, n); break;
+        case 3: ms_c_row_to_i16_neon(3, vx, v, d, n); break;
+        case 4: ms_c_row_to_i16_neon(4, vx, v, d, n); break;
+        case 5: ms_c_row_to_i16_neon(5, vx, v, d, n); break;
+        case 6: ms_c_row_to_i16_neon(6, vx, v, d, n); break;
+        default: GGML_ABORT("invalid MS_C bits");
+    }
+#else
+    ggml_ms_c_to_i16_generic(k, vx, v, d, n);
+#endif
+}

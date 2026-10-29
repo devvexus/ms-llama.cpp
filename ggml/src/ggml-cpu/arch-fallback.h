@@ -86,9 +86,6 @@
 #define ggml_ms_c_quantize_i16_generic ggml_ms_c_quantize_i16
 #define ggml_ms_c_gemm_i16_generic ggml_ms_c_gemm_i16
 #elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC)
-// quants.c
-#define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
-#define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
 // repack.cpp
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
 #define ggml_quantize_mat_q8_K_4x8_generic ggml_quantize_mat_q8_K_4x8
