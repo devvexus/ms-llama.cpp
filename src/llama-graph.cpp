@@ -1529,13 +1529,13 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
 }
 
-ggml_tensor * llm_graph_result::get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot) const {
-    const auto it = hdmd_inputs.find({ cur, rot });
+ggml_tensor * llm_graph_result::get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, const ggml_tensor * signs) const {
+    const auto it = hdmd_inputs.find({ cur, rot, signs });
     return it == hdmd_inputs.end() ? nullptr : it->second;
 }
 
-void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, ggml_tensor * res) {
-    hdmd_inputs[{ cur, rot }] = res;
+void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, const ggml_tensor * signs, ggml_tensor * res) {
+    hdmd_inputs[{ cur, rot, signs }] = res;
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1619,7 +1619,7 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
         return cur;
     }
     const auto & t = it->second;
-    if (ggml_tensor * x = res->get_hdmd_input(cur, t.rot)) {
+    if (ggml_tensor * x = res->get_hdmd_input(cur, t.rot, t.signs)) {
         return x;
     }
     ggml_tensor * x = cur;
@@ -1635,7 +1635,7 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
         x = ggml_mul(ctx0, x, t.signs);
     }
     x = llama_mul_mat_hadamard(ctx0, x, t.rot);
-    res->set_hdmd_input(cur, t.rot, x);
+    res->set_hdmd_input(cur, t.rot, t.signs, x);
     return x;
 }
 
