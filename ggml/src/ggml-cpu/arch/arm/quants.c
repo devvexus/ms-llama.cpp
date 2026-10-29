@@ -4378,22 +4378,28 @@ static inline float ms_c_block_dot_neon(const int k, const uint8_t * GGML_RESTRI
     memcpy(head + 2, qs, 14);
     memcpy(tail, qs + 2*k*gt - 2, nq + 2 - 2*k*gt);
 
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    float32x4_t acc2 = vdupq_n_f32(0.0f);
-    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    float32x4_t acc[4] = { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) };
 
-    for (int g = 0; g < QK_MS/16; ++g) {
-        const uint8_t * p = g == 0 ? head : g < gt ? qs + 2*k*g - 2 : tail + 2*k*(g - gt);
-        const uint8x16_t v = vld1q_u8(p);
-        const float * yg = y + 16*g;
-        acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i0, h0))), vld1q_f32(yg +  0));
-        acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i1, h1))), vld1q_f32(yg +  4));
-        acc2 = vfmaq_f32(acc2, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i2, h2))), vld1q_f32(yg +  8));
-        acc3 = vfmaq_f32(acc3, vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i3, h3))), vld1q_f32(yg + 12));
+#define GGML_MS_C_GROUP_NEON(P, G)                                                                                      \
+    do {                                                                                                                \
+        const uint8x16_t v = vld1q_u8(P);                                                                               \
+        const float * yg = y + 16*(G);                                                                                  \
+        acc[0] = vfmaq_f32(acc[0], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i0, h0))), vld1q_f32(yg +  0));  \
+        acc[1] = vfmaq_f32(acc[1], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i1, h1))), vld1q_f32(yg +  4));  \
+        acc[2] = vfmaq_f32(acc[2], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i2, h2))), vld1q_f32(yg +  8));  \
+        acc[3] = vfmaq_f32(acc[3], vcvtq_f32_s32(ms_c_value4_neon(ms_c_state4_neon(v, i3, h3))), vld1q_f32(yg + 12));  \
+    } while (0)
+
+    GGML_MS_C_GROUP_NEON(head, 0);
+    for (int g = 1; g < gt; ++g) {
+        GGML_MS_C_GROUP_NEON(qs + 2*k*g - 2, g);
     }
+    for (int g = gt; g < QK_MS/16; ++g) {
+        GGML_MS_C_GROUP_NEON(tail + 2*k*(g - gt), g);
+    }
+#undef GGML_MS_C_GROUP_NEON
 
-    return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+    return vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])));
 }
 
 #define GGML_MS_C_VEC_DOT_NEON(K)                                                                                       \
