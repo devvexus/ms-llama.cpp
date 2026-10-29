@@ -42,6 +42,7 @@
 #define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
+#define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -98,6 +99,8 @@
 #define ggml_ms_c_quantize_i16_generic ggml_ms_c_quantize_i16
 #define ggml_ms_c_gemm_i16_generic ggml_ms_c_gemm_i16
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+// quants.c
+#define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
@@ -145,6 +148,7 @@
 #define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
+#define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -206,6 +210,7 @@
 #define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
+#define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -261,6 +266,7 @@
 #define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
+#define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x1_generic ggml_quantize_mat_q8_0_4x1
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
@@ -326,6 +332,7 @@
 #define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
+#define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
@@ -391,6 +398,7 @@
 #define ggml_vec_dot_ms_c6_f32_generic ggml_vec_dot_ms_c6_f32
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
+#define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
