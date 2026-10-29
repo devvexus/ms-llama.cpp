@@ -25,6 +25,9 @@ void llama_model_clef::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_clef::load_arch_tensors(llama_model_loader & ml) {
     llama_model_qwen35::load_arch_tensors(ml);
+    if (emb_split.n_hi) {
+        throw std::runtime_error("a split token embedding is not supported");
+    }
 
     LLAMA_LOAD_LOCALS;
 
