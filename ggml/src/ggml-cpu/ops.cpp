@@ -2570,21 +2570,25 @@ static void ggml_compute_forward_silu_f32(
     const int nc = src0->ne[0];
     const int nr = ggml_nrows(src0);
 
+    // fewer rows than threads (one token): each thread takes a part of every row
+    const bool split_cols = nr < nth;
+    const auto [c0, c1] = split_cols ? get_thread_col_range(params, nc) : std::pair<int64_t, int64_t>(0, nc);
+
     // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const int dr = split_cols ? nr : (nr + nth - 1)/nth;
 
     // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    const int ir0 = split_cols ? 0 : dr*ith;
+    const int ir1 = c0 < c1 ? MIN(ir0 + dr, nr) : ir0;
 
     for (int ir = ir0; ir < ir1; ++ir) {
         const int i3 = ir/(ne02*ne01);
         const int i2 = (ir - i3*ne02*ne01)/ne01;
         const int i1 = (ir - i3*ne02*ne01 - i2*ne01);
 
-        ggml_vec_silu_f32(nc,
-                (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1),
-                (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01));
+        ggml_vec_silu_f32(c1 - c0,
+                (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1) + c0,
+                (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01) + c0);
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {
@@ -3262,12 +3266,16 @@ static void ggml_compute_forward_swiglu_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
+    // fewer rows than threads (one token): each thread takes a part of every row
+    const bool split_cols = nr < nth;
+    const auto [c0, c1] = split_cols ? get_thread_col_range(params, nc) : std::pair<int64_t, int64_t>(0, nc);
+
     // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const int dr = split_cols ? nr : (nr + nth - 1)/nth;
 
     // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    const int ir0 = split_cols ? 0 : dr*ith;
+    const int ir1 = c0 < c1 ? MIN(ir0 + dr, nr) : ir0;
 
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
@@ -3278,7 +3286,7 @@ static void ggml_compute_forward_swiglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_swiglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_swiglu_f32(c1 - c0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + c0, src0_p + c0, src1_p + c0);
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {
@@ -5330,12 +5338,16 @@ static void ggml_compute_forward_get_rows_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // fewer rows than threads (e.g. the recurrent state of one sequence): each thread copies a part of every row
+    const bool split_cols = nr < nth;
+    const auto [c0, c1] = split_cols ? get_thread_col_range(params, nc) : std::pair<int64_t, int64_t>(0, nc);
+
     // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const int dr = split_cols ? nr : (nr + nth - 1)/nth;
 
     // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    const int ir0 = split_cols ? 0 : dr*ith;
+    const int ir1 = c0 < c1 ? MIN(ir0 + dr, nr) : ir0;
 
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
@@ -5345,9 +5357,9 @@ static void ggml_compute_forward_get_rows_f32(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
-        ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+        ggml_vec_cpy_f32(c1 - c0,
+                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + c0,
+                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + c0);
     }
 }
 
