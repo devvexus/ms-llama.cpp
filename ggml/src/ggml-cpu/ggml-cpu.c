@@ -1501,9 +1501,12 @@ UseGgmlGemm1:;
     #endif
     }
 
+    // one src1 column: the threads take ranges of rows from a shared row counter (below)
+    const bool mv_rows = nth > 1 && ne1*ne2*ne3 == 1 && !ggml_is_numa();
+
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        atomic_store_explicit(&params->threadpool->current_chunk, mv_rows ? 0 : nth, memory_order_relaxed);
     }
 
     ggml_barrier(params->threadpool);
@@ -1532,6 +1535,27 @@ UseGgmlGemm1:;
 UseGgmlGemm2:;
 #endif
 
+    if (mv_rows) {
+        // each range is 1/(4*nth) of the rows left, and at least about 16K weights (or 1/nth of the rows of a small matrix):
+        // the ranges get smaller towards the end, so the threads finish at about the same time even when some of them run
+        // on slower cores (e.g. the efficiency cores of a hybrid CPU)
+        const int64_t min_rows = MAX(1, MIN(16384/ne00, (ne0 + nth - 1)/nth));
+
+        for (;;) {
+            const int64_t left = ne0 - atomic_load_explicit(&params->threadpool->current_chunk, memory_order_relaxed);
+            if (left <= 0) {
+                break;
+            }
+            const int64_t n  = MAX(min_rows, left/(4*nth));
+            const int64_t r0 = atomic_fetch_add_explicit(&params->threadpool->current_chunk, (int) n, memory_order_relaxed);
+            if (r0 >= ne0) {
+                break;
+            }
+            ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, 1, r0, MIN(r0 + n, ne0), 0, 1);
+        }
+        return;
+    }
+
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
 
@@ -1556,15 +1580,9 @@ UseGgmlGemm2:;
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
     if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-        // one src1 column: 3 chunks of at least 8 rows per thread, so that a slower thread (e.g. one that shares a core) takes fewer rows
-        const int64_t nchunk_mv = nth * 3;
-        if (nth > 1 && nr1 == 1 && nr0 >= nchunk_mv * 8 && !ggml_is_numa()) {
-            nchunk0 = nchunk_mv;
-        } else {
-            // distribute the thread work across the inner or outer loop based on which one is larger
-            nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-            nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
-        }
+        // distribute the thread work across the inner or outer loop based on which one is larger
+        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
     }
 
     // The number of elements in each chunk
