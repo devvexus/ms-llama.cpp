@@ -87,6 +87,16 @@ static std::pair<int64_t, int64_t> get_thread_range(const struct ggml_compute_pa
     return {ir0, ir1};
 }
 
+// column range of this thread for an op that has fewer rows than threads: the columns of each row are split instead,
+// in multiples of 16 elements
+static std::pair<int64_t, int64_t> get_thread_col_range(const struct ggml_compute_params * params, int64_t nc) {
+    const int64_t dc = ((nc + params->nth - 1)/params->nth + 15) & ~(int64_t) 15;
+    const int64_t c0 = MIN(dc*params->ith, nc);
+    const int64_t c1 = MIN(c0 + dc, nc);
+
+    return {c0, c1};
+}
+
 struct ggml_fa_tile_config {
     static constexpr size_t Q  = GGML_FA_TILE_Q;
     static constexpr size_t KV = GGML_FA_TILE_KV;
