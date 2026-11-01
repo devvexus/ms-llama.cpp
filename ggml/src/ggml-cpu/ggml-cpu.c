@@ -3350,7 +3350,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        // a node with an empty result writes nothing, so the barrier after the previous node is enough
+        if (node_n + 1 < cgraph->n_nodes && (n_fused > 0 || !ggml_is_empty(node))) {
             ggml_barrier(state->threadpool);
         }
     }
