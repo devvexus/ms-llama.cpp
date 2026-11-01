@@ -3121,6 +3121,45 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+#if defined(_WIN32)
+// logical processors of the highest efficiency class when the CPU has cores of different classes (e.g. the performance
+// cores of a hybrid CPU), else 0; initialized once in ggml_cpu_init(), read-only afterwards
+static DWORD_PTR ggml_cpu_perf_core_mask = 0;
+
+static DWORD_PTR ggml_cpu_get_perf_core_mask(void) {
+    ULONG len = 0;
+    GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
+    if (len == 0) {
+        return 0;
+    }
+    char * buf = (char *) malloc(len);
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION) buf, len, &len, GetCurrentProcess(), 0)) {
+        free(buf);
+        return 0;
+    }
+    BYTE cls_min = 255, cls_max = 0;
+    for (ULONG off = 0; off < len; ) {
+        const SYSTEM_CPU_SET_INFORMATION * e = (const SYSTEM_CPU_SET_INFORMATION *) (buf + off);
+        if (e->Type == CpuSetInformation && e->CpuSet.Group == 0 && e->CpuSet.LogicalProcessorIndex < 8*sizeof(DWORD_PTR)) {
+            cls_min = MIN(cls_min, e->CpuSet.EfficiencyClass);
+            cls_max = MAX(cls_max, e->CpuSet.EfficiencyClass);
+        }
+        off += e->Size;
+    }
+    DWORD_PTR mask = 0;
+    for (ULONG off = 0; off < len && cls_max > cls_min; ) {
+        const SYSTEM_CPU_SET_INFORMATION * e = (const SYSTEM_CPU_SET_INFORMATION *) (buf + off);
+        if (e->Type == CpuSetInformation && e->CpuSet.Group == 0 && e->CpuSet.LogicalProcessorIndex < 8*sizeof(DWORD_PTR) &&
+            e->CpuSet.EfficiencyClass == cls_max) {
+            mask |= (DWORD_PTR) 1 << e->CpuSet.LogicalProcessorIndex;
+        }
+        off += e->Size;
+    }
+    free(buf);
+    return mask;
+}
+#endif
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3201,6 +3240,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith);
 #endif
 
+#if defined(_WIN32)
+    // on a hybrid CPU, keep thread 0 on the performance cores during the graph: besides its share of each op it runs the
+    // parts that are not split across threads, which every other thread then waits for
+    DWORD_PTR prev_mask = 0;
+    if (state->ith == 0 && ggml_cpu_perf_core_mask && !ggml_thread_cpumask_is_valid(state->cpumask) &&
+        (atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK) > 1) {
+        prev_mask = SetThreadAffinityMask(GetCurrentThread(), ggml_cpu_perf_core_mask);
+    }
+#endif
+
     struct ggml_compute_params params = {
         /*.ith        =*/ state->ith,
         /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
@@ -3256,6 +3305,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+#if defined(_WIN32)
+    if (prev_mask) {
+        SetThreadAffinityMask(GetCurrentThread(), prev_mask);
+    }
+#endif
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
@@ -4026,6 +4081,10 @@ void ggml_cpu_init(void) {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
+
+#if defined(_WIN32)
+        ggml_cpu_perf_core_mask = ggml_cpu_get_perf_core_mask();
+#endif
 
         is_first_call = false;
     }
