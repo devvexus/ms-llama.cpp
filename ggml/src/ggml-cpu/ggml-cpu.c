@@ -614,9 +614,8 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         return;
     }
 
-#ifdef GGML_USE_OPENMP
-    #pragma omp barrier
-#else
+    // also with OpenMP: all threads of the graph are in the parallel region, and this takes about half the time of an
+    // omp barrier with 10..20 threads on a two-cluster CPU (GB10)
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -631,9 +630,13 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         return;
     }
 
-    // wait for other threads
-    while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+    // wait for other threads; every 256 spins, let a thread that is ready on this core run (with as many threads as
+    // cores, a thread kept off its core would hold up all of them)
+    for (int i = 1; atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed; i++) {
         ggml_thread_cpu_relax();
+        if (i % 256 == 0) {
+            sched_yield();
+        }
     }
 
     // exit barrier (full seq-cst fence)
@@ -643,7 +646,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
-#endif
 }
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
