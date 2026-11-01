@@ -11124,11 +11124,16 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 }
 
 // ggml_compute_forward_gated_delta_net
+// rows j0..j1 of the state of each (head, sequence) ir0..ir1: the rows of a state are updated independently of each other
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
     int64_t ir0,
-    int64_t ir1) {
+    int64_t ir1,
+    int64_t j0,
+    int64_t j1,
+    float * state_copy,
+    bool    state_only) {
 
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
@@ -11196,6 +11201,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    const int64_t nj = j1 - j0;
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
@@ -11206,16 +11213,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
+        // For K=1, write directly to the single output slot to avoid an extra memcpy at the end, or to the destination of a
+        // fused copy when that is the only use of the state (state_only).
         // For K>1, work in scratch and copy out per-token when the slot is in range.
+        // s_out points at row j0 of the state.
         float * s_out = (K > 1)
             ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+            : (state_only ? state_copy : state_out_base) + (iv3 * H + iv1) * S_v * S_v + j0 * S_v;
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v + j0 * S_v;
+        memcpy(s_out, s_in, nj * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -11237,29 +11246,29 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                     delta[i] = expf(g_d[i]);
                 }
                 // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
-                for (int64_t j = 0; j < S_v; ++j) {
+                for (int64_t j = 0; j < nj; ++j) {
                     ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
                 }
             } else {
-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
+                ggml_vec_scale_f32(nj * S_v, s_out, expf(g_d[0]));
             }
 
             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
-            for (int64_t j = 0; j < S_v; ++j) {
+            for (int64_t j = j0; j < j1; ++j) {
                 float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
+                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[(j - j0) * S_v], 0, k_d, 0, 1);
                 delta[j] = (v_d[j] - sum) * beta_val;
             }
 
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
-            for (int64_t j = 0; j < S_v; ++j) {
-                ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+            for (int64_t j = j0; j < j1; ++j) {
+                ggml_vec_mad_f32(S_v, &s_out[(j - j0) * S_v], k_d, delta[j]);
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
-            for (int64_t j = 0; j < S_v; ++j) {
+            for (int64_t j = j0; j < j1; ++j) {
                 float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
+                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[(j - j0) * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
             }
 
@@ -11269,10 +11278,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                     (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                                     (iv3 * H + iv1) * S_v * S_v + j0 * S_v;
+                    memcpy(curr_state_o, s_out, nj * S_v * sizeof(float));
                 }
             }
+        }
+
+        // the final state also goes to the destination of a fused copy (K == 1)
+        if (state_copy && !state_only) {
+            memcpy(state_copy + (iv3 * H + iv1) * S_v * S_v + j0 * S_v, s_out, nj * S_v * sizeof(float));
         }
     }
 }
@@ -11280,9 +11294,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
 static void ggml_compute_forward_gated_delta_net_f32(
         const ggml_compute_params * params,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        float * state_copy,
+        bool    state_only) {
 
     ggml_tensor * V = dst->src[2];
+    const int64_t S_v = V->ne[0];
     int64_t nr = V->ne[1] * V->ne[3];
 
     // disable for NUMA
@@ -11291,10 +11308,31 @@ static void ggml_compute_forward_gated_delta_net_f32(
     int nth = params->nth;
     int ith = params->ith;
 
+    if (V->ne[2] == 1 && nth > 1 && !disable_chunking) {
+        // one token: each thread updates the state rows of the part of the state that it copied in (the GET_ROWS of the
+        // recurrent state of one sequence splits its row the same way), so that most of its reads hit its own cache
+        const auto [c0, c1] = get_thread_col_range(params, nr * S_v * S_v);
+        const int64_t r0 = (c0 + S_v / 2) / S_v;   // rows of all heads, head-major
+        const int64_t r1 = (c1 + S_v / 2) / S_v;
+        for (int64_t ir = r0 / S_v; ir < nr && ir * S_v < r1; ++ir) {
+            const int64_t j0 = MAX(r0, ir * S_v) - ir * S_v;
+            const int64_t j1 = MIN(r1, (ir + 1) * S_v) - ir * S_v;
+            if (j0 < j1) {
+                ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir, ir + 1, j0, j1, state_copy, state_only);
+            }
+        }
+        return;
+    }
+
+    // with few heads, the state rows of each head are split into blocks too (about 4 blocks per thread in all)
+    const int64_t nb  = disable_chunking ? 1 : MAX(1, MIN(S_v / 16, (4 * nth + nr - 1) / nr));
+    const int64_t dj  = (S_v + nb - 1) / nb;
+    const int64_t nrb = nr * nb;
+
     // 4x chunks per thread
     int nth_scaled = nth * 4;
-    int64_t chunk_size = (nr + nth_scaled - 1) / nth_scaled;
-    int64_t nchunk     = (nr + chunk_size - 1) / chunk_size;
+    int64_t chunk_size = (nrb + nth_scaled - 1) / nth_scaled;
+    int64_t nchunk     = (nrb + chunk_size - 1) / chunk_size;
 
     if (nth == 1 || nchunk < nth || disable_chunking) {
       nchunk = nth;
@@ -11306,15 +11344,26 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
     ggml_barrier(params->threadpool);
 
-    const int64_t dr = (nr + nchunk - 1) / nchunk;
+    const int64_t dr = (nrb + nchunk - 1) / nchunk;
 
     int current_chunk = ith;
 
     while (current_chunk < nchunk) {
-        const int64_t ir0 = dr * current_chunk;
-        const int64_t ir1 = MIN(ir0 + dr, nr);
+        const int64_t i0 = dr * current_chunk;
+        const int64_t i1 = MIN(i0 + dr, nrb);
 
-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
+        // (head, block) pairs i0..i1 in head-major order; consecutive blocks of one head are done in one call
+        for (int64_t i = i0; i < i1; ) {
+            const int64_t ir = i / nb;
+            const int64_t ib = i % nb;
+            const int64_t n  = MIN(i1 - i, nb - ib);
+            const int64_t j0 = MIN(ib * dj, S_v);
+            const int64_t j1 = MIN((ib + n) * dj, S_v);
+            if (j0 < j1) {
+                ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir, ir + 1, j0, j1, state_copy, state_only);
+            }
+            i += n;
+        }
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
 }
@@ -11327,13 +11376,27 @@ void ggml_compute_forward_gated_delta_net(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_gated_delta_net_f32(params, dst);
+                ggml_compute_forward_gated_delta_net_f32(params, dst, nullptr, false);
             } break;
         default:
             {
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+// GATED_DELTA_NET with one state snapshot (K == 1) that also writes its final state to state_copy (contiguous F32, laid
+// out as the state part of dst): fuses the copy of the new state into the recurrent cache. With state_only, the state
+// part of dst is not written.
+void ggml_compute_forward_gated_delta_net_cpy_state(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        float * state_copy,
+        bool    state_only) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 1);
+
+    ggml_compute_forward_gated_delta_net_f32(params, dst, state_copy, state_only);
 }
 
 
