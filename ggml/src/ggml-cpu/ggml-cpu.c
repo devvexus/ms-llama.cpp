@@ -3259,6 +3259,39 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 
+    if (node->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(node, 0) == 1) {
+        // GATED_DELTA_NET + CPY of its new state (into the recurrent cache): the op writes the state to the copy's
+        // destination as well, from the threads that computed it, and the copy is skipped
+        int j = node_n + 1;
+        while (j < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+            j++;
+        }
+        if (j < cgraph->n_nodes) {
+            const struct ggml_tensor * cpy = cgraph->nodes[j];
+            const struct ggml_tensor * src = cpy->src[0];
+            const int64_t S_v = node->src[2]->ne[0];
+            const size_t  offs = ggml_nbytes(node) - (size_t) ggml_nelements(src)*sizeof(float);
+            if (cpy->op == GGML_OP_CPY && src->view_src == node && src->view_offs == offs &&
+                node->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 && cpy->type == GGML_TYPE_F32 &&
+                ggml_nelements(src) == S_v*S_v*node->src[2]->ne[1]*node->src[2]->ne[3] &&
+                ggml_is_contiguous(src) && ggml_is_contiguous(cpy) && (cpy->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+
+                // when the copied view is the only use of the state part, the state is updated in the destination of the
+                // copy directly and the state part of the result is not written
+                bool state_only = false;
+                if (ggml_node_get_use_count(cgraph, node_n) == 2 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    for (int i = node_n + 1; i < j; i++) {
+                        if (cgraph->nodes[i] == src) {
+                            state_only = ggml_node_get_use_count(cgraph, i) == 1 && !(src->flags & GGML_TENSOR_FLAG_OUTPUT);
+                        }
+                    }
+                }
+                ggml_compute_forward_gated_delta_net_cpy_state(params, node, (float *) cpy->data, state_only);
+                return j - node_n;
+            }
+        }
+    }
+
     return 0;
 }
 
