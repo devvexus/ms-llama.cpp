@@ -1643,6 +1643,66 @@ UseGgmlGemm2:;
     }
 }
 
+// two mat-vecs of MS_C weights by the same F32 column (e.g. ffn_gate and ffn_up): can they share one range of rows?
+static bool ggml_cpu_mul_mat_vec_can_share(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const struct ggml_tensor * x = a->src[1];
+    if (b->op != GGML_OP_MUL_MAT || b->src[1] != x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        return false;
+    }
+    if (ggml_nelements(x) != x->ne[0] || ggml_get_op_params_i32(a, 1) != 0 || ggml_get_op_params_i32(b, 1) != 0) {
+        return false;
+    }
+    for (int i = 0; i < 2; i++) {
+        const struct ggml_tensor * t = i == 0 ? a : b;
+        const struct ggml_tensor * w = t->src[0];
+        if (ggml_ms_c_bits(w->type) <= 0 || type_traits_cpu[w->type].vec_dot_type != GGML_TYPE_F32 ||
+            w->ne[2] != 1 || w->ne[3] != 1 || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+            (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the rows of a and then of b in one range, taken by the threads as in the one-column case of ggml_compute_forward_mul_mat
+static void ggml_compute_forward_mul_mat_vec_pair(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * a,
+              struct ggml_tensor * b) {
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t na = a->ne[0];
+    const int64_t nr = na + b->ne[0];
+    const int64_t min_rows = MAX(1, MIN(16384/a->src[0]->ne[0], (nr + nth - 1)/nth));
+
+    if (ith == 0) {
+        atomic_store_explicit(&params->threadpool->current_chunk, 0, memory_order_relaxed);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    for (;;) {
+        const int64_t left = nr - atomic_load_explicit(&params->threadpool->current_chunk, memory_order_relaxed);
+        if (left <= 0) {
+            break;
+        }
+        const int64_t n  = MAX(min_rows, left/(4*nth));
+        const int64_t r0 = atomic_fetch_add_explicit(&params->threadpool->current_chunk, (int) n, memory_order_relaxed);
+        if (r0 >= nr) {
+            break;
+        }
+        const int64_t r1 = MIN(r0 + n, nr);
+        if (r0 < na) {
+            ggml_compute_forward_mul_mat_one_chunk(params, a, a->src[0]->type, 1, r0, MIN(r1, na), 0, 1);
+        }
+        if (r1 > na) {
+            ggml_compute_forward_mul_mat_one_chunk(params, b, b->src[0]->type, 1, MAX(r0, na) - na, r1 - na, 0, 1);
+        }
+    }
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -3318,6 +3378,19 @@ static int ggml_cpu_try_fuse_ops(
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && params->nth > 1 && !ggml_is_numa()) {
+        // MUL_MAT + MUL_MAT of the same column (views between them aside): one shared range of rows, and one barrier
+        // instead of two
+        int j = node_n + 1;
+        while (j < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+            j++;
+        }
+        if (j < cgraph->n_nodes && ggml_cpu_mul_mat_vec_can_share(node, cgraph->nodes[j])) {
+            ggml_compute_forward_mul_mat_vec_pair(params, node, cgraph->nodes[j]);
+            return j - node_n;
         }
     }
 
