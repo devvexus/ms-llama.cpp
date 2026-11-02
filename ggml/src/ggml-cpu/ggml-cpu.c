@@ -614,8 +614,12 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         return;
     }
 
-    // also with OpenMP: all threads of the graph are in the parallel region, and this takes about half the time of an
-    // omp barrier with 10..20 threads on a two-cluster CPU (GB10)
+    // with OpenMP, the counter barrier below is used on ARM only: all threads of the graph are in the parallel region,
+    // and there it takes about half the time of an omp barrier with 10..20 threads on a two-cluster CPU (GB10); on x86
+    // with more threads than physical cores (SMT) it is slower than the omp barrier
+#if defined(GGML_USE_OPENMP) && !(defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64))
+    #pragma omp barrier
+#else
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -630,14 +634,21 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         return;
     }
 
-    // wait for other threads; every 256 spins, let a thread that is ready on this core run (with as many threads as
-    // cores, a thread kept off its core would hold up all of them)
+    // wait for other threads
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
+    // on ARM, every 256 spins, let a thread that is ready on this core run (with as many threads as cores, a thread
+    // kept off its core would hold up all of them)
     for (int i = 1; atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed; i++) {
         ggml_thread_cpu_relax();
         if (i % 256 == 0) {
             sched_yield();
         }
     }
+#else
+    while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+        ggml_thread_cpu_relax();
+    }
+#endif
 
     // exit barrier (full seq-cst fence)
     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
@@ -646,6 +657,7 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
+#endif
 }
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
