@@ -167,6 +167,45 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+// one-column mat-vecs of MS_C weights that read the same src1 are moved next to each other (e.g. the qkv and gate
+// projections of a linear-attention layer), so that the CPU backend runs each pair with one shared range of rows
+static void ggml_backend_cpu_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(backend);
+    GGML_UNUSED(params);
+
+    auto is_mat_vec = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_MUL_MAT && t->src[0]->type >= GGML_TYPE_MS_C1 && t->src[0]->type <= GGML_TYPE_MS_C6 &&
+               t->src[0]->op == GGML_OP_NONE &&
+               t->src[0]->view_src == nullptr && ggml_nelements(t->src[1]) == t->src[1]->ne[0];
+    };
+
+    for (int i = 0; i < cgraph->n_nodes - 1; i++) {
+        ggml_tensor * a = cgraph->nodes[i];
+        if (!is_mat_vec(a)) {
+            continue;
+        }
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+            j++;
+        }
+        if (j < cgraph->n_nodes && is_mat_vec(cgraph->nodes[j]) && cgraph->nodes[j]->src[1] == a->src[1]) {
+            i = j; // already a pair
+            continue;
+        }
+        // the next mat-vec of the same src1: its inputs (a weight and src1) are ready at i, and no node before it reads
+        // its result, so it can run right after a
+        for (j = i + 1; j < cgraph->n_nodes; j++) {
+            ggml_tensor * b = cgraph->nodes[j];
+            if (is_mat_vec(b) && b->src[1] == a->src[1]) {
+                memmove(&cgraph->nodes[i + 2], &cgraph->nodes[i + 1], (j - i - 1)*sizeof(cgraph->nodes[0]));
+                cgraph->nodes[i + 1] = b;
+                i++;
+                break;
+            }
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
@@ -206,7 +245,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_cpu_graph_optimize,
 };
 
 static ggml_guid_t ggml_backend_cpu_guid(void) {
