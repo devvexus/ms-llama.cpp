@@ -5373,8 +5373,13 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
                     }
                 }
             } else {
+                // the groups of the range against the columns in chunks of about 128 KB of src1 blocks, so that a chunk is read
+                // into L2 once per range rather than once per group (the cores' shared L3 has to serve all threads)
                 if (mg > 0) {
-                    gemm(ne00, dst, ldd, w, a, (int) n4, (int) mg);
+                    const int64_t nc = 4*MAX(1, (int64_t) (128*1024/as));
+                    for (int64_t c0 = 0; c0 < n4; c0 += nc) {
+                        gemm(ne00, dst + c0*ldd, ldd, w, a + (c0/4)*as, (int) MIN(nc, n4 - c0), (int) mg);
+                    }
                 }
                 // the last partial group of src0 rows, then the last partial group of src1 columns, through t
                 if (mg < m) {
