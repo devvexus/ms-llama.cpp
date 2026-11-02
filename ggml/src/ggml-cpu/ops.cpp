@@ -12404,6 +12404,68 @@ static inline float ggml_fwht_load(const ggml_fp16_t value) {
     return ggml_fp16_to_fp32(value);
 }
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+// NS stages (len, 2*len, 4*len) of the transform of x in one pass, on groups of 2^NS vectors at a stride of len
+template<int NS>
+static inline void ggml_fwht_pass_neon(float * x, const int64_t n, const int64_t len) {
+    constexpr int nv = 1 << NS;
+    for (int64_t i = 0; i < n; i += len*nv) {
+        for (int64_t j = 0; j < len; j += 4) {
+            float32x4_t v[nv];
+            for (int m = 0; m < nv; m++) {
+                v[m] = vld1q_f32(x + i + j + m*len);
+            }
+            for (int s = 0; s < NS; s++) {
+                for (int m = 0; m < nv; m++) {
+                    if (m & (1 << s)) {
+                        continue;
+                    }
+                    const float32x4_t u = v[m];
+                    const float32x4_t w = v[m + (1 << s)];
+                    v[m]            = vaddq_f32(u, w);
+                    v[m + (1 << s)] = vsubq_f32(u, w);
+                }
+            }
+            for (int m = 0; m < nv; m++) {
+                vst1q_f32(x + i + j + m*len, v[m]);
+            }
+        }
+    }
+}
+
+// the transform of x (n >= 16) in place: the same sums and differences per element as the scalar and SIMD passes of
+// ggml_compute_forward_fwht_impl (so the same results), with the stages 1, 2, 4 and 8 in one pass and then three per pass
+static void ggml_fwht_row_neon(float * x, const int64_t n) {
+    for (int64_t i = 0; i < n; i += 16) {
+        float32x4_t v[4];
+        for (int m = 0; m < 4; m++) {
+            const float32x4_t a = vld1q_f32(x + i + 4*m);
+            const float32x4_t r = vrev64q_f32(a);
+            const float32x4_t b = vtrn1q_f32(vaddq_f32(a, r), vsubq_f32(a, r));
+            const float32x4_t e = vextq_f32(b, b, 2);
+            v[m] = vcombine_f32(vget_low_f32(vaddq_f32(b, e)), vget_low_f32(vsubq_f32(b, e)));
+        }
+        const float32x4_t s0 = vaddq_f32(v[0], v[1]);
+        const float32x4_t d0 = vsubq_f32(v[0], v[1]);
+        const float32x4_t s1 = vaddq_f32(v[2], v[3]);
+        const float32x4_t d1 = vsubq_f32(v[2], v[3]);
+        vst1q_f32(x + i +  0, vaddq_f32(s0, s1));
+        vst1q_f32(x + i +  4, vaddq_f32(d0, d1));
+        vst1q_f32(x + i +  8, vsubq_f32(s0, s1));
+        vst1q_f32(x + i + 12, vsubq_f32(d0, d1));
+    }
+    for (int64_t len = 16; len < n; len *= 8) {
+        if (len*2 == n) {
+            ggml_fwht_pass_neon<1>(x, n, len);
+        } else if (len*4 == n) {
+            ggml_fwht_pass_neon<2>(x, n, len);
+        } else {
+            ggml_fwht_pass_neon<3>(x, n, len);
+        }
+    }
+}
+#endif
+
 template<typename src_t>
 static void ggml_compute_forward_fwht_impl(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -12442,6 +12504,13 @@ static void ggml_compute_forward_fwht_impl(const ggml_compute_params * params, g
         for (int64_t j = 0; j < n; j++) {
             dst_row[j] = ggml_fwht_load(src_row[j]) * scale;
         }
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        if (n >= 16) {
+            ggml_fwht_row_neon(dst_row, n);
+            continue;
+        }
+#endif
 
         // Scalar passes
 #if defined(GGML_SIMD)
