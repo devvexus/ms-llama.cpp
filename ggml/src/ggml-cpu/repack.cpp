@@ -5331,17 +5331,24 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
         }
 
         if (ith == 0) {
-            ggml_threadpool_chunk_set(params->threadpool, nth);
+            ggml_threadpool_chunk_set(params->threadpool, 0);
         }
 
         ggml_barrier(params->threadpool);
 
-        const int64_t nchunk = (ne01 + nr - 1)/nr;
-
-        int64_t chunk = ith;
-        while (chunk < nchunk) {
-            const int64_t ir0 = chunk*nr;
-            const int64_t m   = MIN(nr, ne01 - ir0);
+        // ranges of src0 rows from a shared counter: a whole tile while many rows are left, then 1/(2*nth) of the rows left
+        // (whole groups), so that the last ranges are short and the threads end together also on cores of different speed
+        for (;;) {
+            const int64_t left = ne01 - ggml_threadpool_chunk_get(params->threadpool);
+            if (left <= 0) {
+                break;
+            }
+            const int64_t n   = MIN(nr, GGML_PAD(MAX(1, left/(2*nth)), gr));
+            const int64_t ir0 = ggml_threadpool_chunk_add(params->threadpool, (int) n);
+            if (ir0 >= ne01) {
+                break;
+            }
+            const int64_t m   = MIN(n, ne01 - ir0);
             const int64_t mg  = m - m % gr;
             const int64_t mp  = GGML_PAD(m, gr);
             float       * dst = (float *) op->data + ir0;
@@ -5383,11 +5390,6 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
                     }
                 }
             }
-
-            if (nth >= nchunk) {
-                break;
-            }
-            chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
 
         return true;
