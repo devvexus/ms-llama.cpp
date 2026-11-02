@@ -3352,6 +3352,16 @@ static DWORD_PTR ggml_cpu_get_perf_core_mask(void) {
     free(buf);
     return mask;
 }
+
+bool ggml_cpu_on_perf_core(void) {
+    PROCESSOR_NUMBER pn;
+    GetCurrentProcessorNumberEx(&pn);
+    return pn.Group == 0 && pn.Number < 8*sizeof(DWORD_PTR) && ((ggml_cpu_perf_core_mask >> pn.Number) & 1);
+}
+#else
+bool ggml_cpu_on_perf_core(void) {
+    return false;
+}
 #endif
 
 static int ggml_cpu_try_fuse_ops(

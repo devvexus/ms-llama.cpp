@@ -5202,8 +5202,8 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
 
         ggml_barrier(params->threadpool);
 
-        // as the one-column case of the default MUL_MAT: each range is 1/(4*nth) of the rows left, and at least about 16K weights
-        // (or 1/nth of the rows of a small matrix)
+        // each range is 1/(2*nth) of the rows left, twice that for a thread on a performance core of a hybrid CPU (about twice
+        // as fast here), and at least about 16K weights (or 1/nth of the rows of a small matrix)
         const int64_t min_rows = MAX(1, MIN(16384/ne00, (nr + nth - 1)/nth));
 
         for (;;) {
@@ -5211,7 +5211,7 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
             if (left <= 0) {
                 break;
             }
-            const int64_t n  = MAX(min_rows, left/(4*nth));
+            const int64_t n  = MAX(min_rows, left/(2*nth))*(ggml_cpu_on_perf_core() ? 2 : 1);
             const int64_t r0 = ggml_threadpool_chunk_add(params->threadpool, (int) n);
             if (r0 >= nr) {
                 break;

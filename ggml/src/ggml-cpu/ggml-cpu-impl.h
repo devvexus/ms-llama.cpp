@@ -536,6 +536,9 @@ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_get(struct ggml_threadpool * tp);
 
+// whether the calling thread runs on a performance core of a hybrid CPU (known on Windows only, else false)
+bool ggml_cpu_on_perf_core(void);
+
 #ifdef __cplusplus
 }
 #endif
