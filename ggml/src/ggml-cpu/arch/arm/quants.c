@@ -15,6 +15,10 @@
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_NEON_SVE_BRIDGE)
+#include <arm_neon_sve_bridge.h>
+#endif
+
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
 #define GROUP_MAX_EPS_IQ2_S 1e-8f
@@ -4349,19 +4353,35 @@ static inline uint8x16_t ms_c_hash4_neon(const uint32x4_t st) {
     return vreinterpretq_u8_u32(vaddq_u32(vmulq_u32(st, vdupq_n_u32(GGML_MS_C_A)), vdupq_n_u32(GGML_MS_C_B)));
 }
 
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_NEON_SVE_BRIDGE)
+// base + (sum of the 4 bytes of A*s + B) with SVE: A*s + B is one MAD in place (no copy of B, no MUL then ADD), and the UDOT
+// accumulates onto a MOVPRFX copy of base, which costs far less on cores such as Cortex-X925 than the MOV or MOVI copy that the
+// destructive NEON UDOT needs: 4 vector instructions per 4 values become 2 plus the MOVPRFX. Only the low 128 bits are used.
+static inline uint32x4_t ms_c_bytesum4_sve(const uint32x4_t st, const uint32_t base) {
+    const svuint32_t x = svmad_u32_x(svptrue_b32(), svset_neonq_u32(svundef_u32(), st), svdup_n_u32(GGML_MS_C_A), svdup_n_u32(GGML_MS_C_B));
+    svuint32_t r;
+    __asm__("movprfx %0, %1\n\tudot %0.s, %2.b, %3.b" : "=&w"(r) : "w"(svdup_n_u32(base)), "w"(x), "w"(svdup_n_u8(1)));
+    return svget_neonq_u32(r);
+}
+#endif
+
 static inline int32x4_t ms_c_value4_neon(const uint32x4_t st) {
-    const uint8x16_t x = ms_c_hash4_neon(st);
-#if defined(__ARM_FEATURE_DOTPROD)
-    return vreinterpretq_s32_u32(vdotq_u32(vdupq_n_u32((uint32_t) -510), x, vdupq_n_u8(1)));
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_NEON_SVE_BRIDGE)
+    return vreinterpretq_s32_u32(ms_c_bytesum4_sve(st, (uint32_t) -510));
+#elif defined(__ARM_FEATURE_DOTPROD)
+    return vreinterpretq_s32_u32(vdotq_u32(vdupq_n_u32((uint32_t) -510), ms_c_hash4_neon(st), vdupq_n_u8(1)));
 #else
-    return vsubq_s32(vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(x))), vdupq_n_s32(510));
+    return vsubq_s32(vreinterpretq_s32_u32(vpaddlq_u16(vpaddlq_u8(ms_c_hash4_neon(st)))), vdupq_n_s32(510));
 #endif
 }
 
 // the values as F32: the byte sum is added onto the bits of 2^23, which gives 2^23 + sum exactly (sum < 2^23), and one FSUB of
 // 2^23 + 510 then gives the value exactly, instead of an int to float conversion (slower than FSUB on such cores)
 static inline float32x4_t ms_c_valuef4_neon(const uint32x4_t st) {
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_NEON_SVE_BRIDGE)
+    const uint32x4_t f = ms_c_bytesum4_sve(st, 0x4B000000u);
+    return vsubq_f32(vreinterpretq_f32_u32(f), vdupq_n_f32(8388608.0f + 510.0f));
+#elif defined(__ARM_FEATURE_DOTPROD)
     const uint32x4_t f = vdotq_u32(vdupq_n_u32(0x4B000000u), ms_c_hash4_neon(st), vdupq_n_u8(1));
     return vsubq_f32(vreinterpretq_f32_u32(f), vdupq_n_f32(8388608.0f + 510.0f));
 #else
@@ -4374,37 +4394,112 @@ static inline uint32x4_t ms_c_state4_neon(const uint8x16_t p, const uint8x16_t i
 }
 
 #if defined(__ARM_FEATURE_FMA)
-// sum over the block of value_i * y_i (without the scale d)
-static inline float ms_c_block_dot_neon(const int k, const uint8_t * GGML_RESTRICT qs, const uint32_t s0, const float * GGML_RESTRICT y) {
-    const uint8x16_t i0 = vld1q_u8(ms_c_tbl[k - 1] +  0);
-    const uint8x16_t i1 = vld1q_u8(ms_c_tbl[k - 1] + 16);
-    const uint8x16_t i2 = vld1q_u8(ms_c_tbl[k - 1] + 32);
-    const uint8x16_t i3 = vld1q_u8(ms_c_tbl[k - 1] + 48);
-    const int32x4_t  h0 = vld1q_s32(ms_c_shl[k - 1] +  0);
-    const int32x4_t  h1 = vld1q_s32(ms_c_shl[k - 1] +  4);
-    const int32x4_t  h2 = vld1q_s32(ms_c_shl[k - 1] +  8);
-    const int32x4_t  h3 = vld1q_s32(ms_c_shl[k - 1] + 12);
+// k = 6: no byte of P is the first byte of two words that need it masked differently, so the first byte of a word with
+// (j*k + 2)%8 = o > 0 comes from p & ms_c6_msk (masked to its low 8 - o bits, TBL index + 16): one right shift by 18 - o then
+// gives the state, without the AND (o, and so the shift, repeats every 4 lanes)
+static const uint8_t ms_c6_tbl[64] = {
+    3, 2, 1, 16, 4, 3, 2, 1, 4, 3, 2, 17, 5, 4, 3, 18, 6, 5, 4, 19, 7, 6, 5, 4, 7, 6, 5, 20, 8, 7, 6, 21,
+    9, 8, 7, 22, 10, 9, 8, 7, 10, 9, 8, 23, 11, 10, 9, 24, 12, 11, 10, 25, 13, 12, 11, 10, 13, 12, 11, 26, 14, 13, 12, 27,
+};
+static const uint8_t ms_c6_msk[16] = { 0x3f, 0x03, 0x0f, 0x3f, 0x03, 0x0f, 0x3f, 0x03, 0x0f, 0x3f, 0x03, 0x0f, 0xff, 0xff, 0xff, 0xff };
+static const int32_t ms_c6_shr[4]  = { -16, -18, -12, -14 };
 
-    // group 0 holds s0, and the groups from gt on would read past the block: both are read from copies of P
+// k <= 3: the word of lane j < 4 also holds state j + 4 (o + 4k + 14 <= 32), and the same for 8 <= j < 12 and j + 4, so one
+// TBL gives the words of two vectors of states: right shifts by 18 - o (state j) and 18 - o - 4k (state j + 4), then the AND
+static const uint8_t ms_c_tbl2w[3][32] = {
+    { 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1 },
+    { 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 5, 4, 3, 2, 5, 4, 3, 2, 5, 4, 3, 2, 6, 5, 4, 3 },
+    { 3, 2, 1, 0, 3, 2, 1, 0, 4, 3, 2, 1, 4, 3, 2, 1, 6, 5, 4, 3, 6, 5, 4, 3, 7, 6, 5, 4, 7, 6, 5, 4 },
+};
+static const int32_t ms_c_shr2w[3][8] = {
+    { -16, -15, -14, -13, -12, -11, -10,  -9 },
+    { -16, -14, -12, -18,  -8,  -6,  -4, -10 },
+    { -16, -13, -18, -15,  -4,  -1,  -6,  -3 },
+};
+
+// the 16 states of a group from the 16 bytes p of P there; idx, sh and m6 as loaded by ms_c_block_dot_neon for this k
+static inline void ms_c_states16_neon(const int k, const uint8x16_t p, const uint8x16_t idx[4], const int32x4_t sh[4], const uint8x16_t m6, uint32x4_t st[4]) {
+#if defined(__aarch64__)
+    if (k == 6) {
+        const uint8x16x2_t t = { { p, vandq_u8(p, m6) } };
+        for (int i = 0; i < 4; ++i) {
+            st[i] = vshlq_u32(vreinterpretq_u32_u8(vqtbl2q_u8(t, idx[i])), sh[0]);
+        }
+        return;
+    }
+#endif
+    if (k <= 3) {
+        const uint32x4_t w0 = vreinterpretq_u32_u8(ggml_vqtbl1q_u8(p, idx[0]));
+        const uint32x4_t w1 = vreinterpretq_u32_u8(ggml_vqtbl1q_u8(p, idx[1]));
+        const uint32x4_t m  = vdupq_n_u32(GGML_MS_STATE_MASK);
+        st[0] = vandq_u32(vshlq_u32(w0, sh[0]), m);
+        st[1] = vandq_u32(vshlq_u32(w0, sh[1]), m);
+        st[2] = vandq_u32(vshlq_u32(w1, sh[0]), m);
+        st[3] = vandq_u32(vshlq_u32(w1, sh[1]), m);
+        return;
+    }
+    for (int i = 0; i < 4; ++i) {
+        st[i] = ms_c_state4_neon(p, idx[i], sh[i]);
+    }
+}
+
+// sum over the block of value_i * y_i (without the scale d); qs as in the block, with s0 in the 2 bytes before it. Unless last,
+// the block is followed by at least 14 more bytes of the row.
+static inline float ms_c_block_dot_neon(const int k, const uint8_t * GGML_RESTRICT qs, const float * GGML_RESTRICT y, const bool last) {
+    uint8x16_t idx[4];
+    int32x4_t  sh[4];
+    uint8x16_t m6 = vdupq_n_u8(0xff);
+#if defined(__aarch64__)
+    if (k == 6) {
+        for (int i = 0; i < 4; ++i) {
+            idx[i] = vld1q_u8(ms_c6_tbl + 16*i);
+        }
+        sh[0] = vld1q_s32(ms_c6_shr);
+        sh[1] = sh[2] = sh[3] = sh[0];
+        m6 = vld1q_u8(ms_c6_msk);
+    } else
+#endif
+    if (k <= 3) {
+        idx[0] = vld1q_u8(ms_c_tbl2w[k - 1] +  0);
+        idx[1] = vld1q_u8(ms_c_tbl2w[k - 1] + 16);
+        idx[2] = idx[0];
+        idx[3] = idx[1];
+        sh[0]  = vld1q_s32(ms_c_shr2w[k - 1] + 0);
+        sh[1]  = vld1q_s32(ms_c_shr2w[k - 1] + 4);
+        sh[2]  = sh[0];
+        sh[3]  = sh[1];
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            idx[i] = vld1q_u8(ms_c_tbl[k - 1] + 16*i);
+            sh[i]  = vld1q_s32(ms_c_shl[k - 1] + 4*i);
+        }
+    }
+
+    // group 0 is the 16 bytes from s0 with its two (little-endian) bytes swapped; the top 2 bits of s0 are bits 0 and 1 of P, which
+    // no state uses. The groups from gt on read up to 14 - 2k bytes past the block, which only the last block reads from a copy.
+    static const uint8_t ms_c_swap01[16] = { 1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const int nq = QK_MS*k/8;
     const int gt = k == 1 ? 26 : k == 2 ? 29 : k == 3 ? 30 : 31;
     uint8_t head[16];
     uint8_t tail[32] = { 0 };
-    head[0] = (uint8_t) (s0 >> 8);
-    head[1] = (uint8_t) s0;
-    memcpy(head + 2, qs, 14);
-    memcpy(tail, qs + 2*k*gt - 2, nq + 2 - 2*k*gt);
+    vst1q_u8(head, ggml_vqtbl1q_u8(vld1q_u8(qs - 2), vld1q_u8(ms_c_swap01)));
+    const uint8_t * pt = qs + 2*k*gt - 2;
+    if (last) {
+        memcpy(tail, pt, nq + 2 - 2*k*gt);
+        pt = tail;
+    }
 
     float32x4_t acc[4] = { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) };
 
 #define GGML_MS_C_GROUP_NEON(P, G)                                                                                      \
     do {                                                                                                                \
-        const uint8x16_t v = vld1q_u8(P);                                                                               \
+        uint32x4_t st[4];                                                                                               \
+        ms_c_states16_neon(k, vld1q_u8(P), idx, sh, m6, st);                                                            \
         const float * yg = y + 16*(G);                                                                                  \
-        acc[0] = vfmaq_f32(acc[0], ms_c_valuef4_neon(ms_c_state4_neon(v, i0, h0)), vld1q_f32(yg +  0));  \
-        acc[1] = vfmaq_f32(acc[1], ms_c_valuef4_neon(ms_c_state4_neon(v, i1, h1)), vld1q_f32(yg +  4));  \
-        acc[2] = vfmaq_f32(acc[2], ms_c_valuef4_neon(ms_c_state4_neon(v, i2, h2)), vld1q_f32(yg +  8));  \
-        acc[3] = vfmaq_f32(acc[3], ms_c_valuef4_neon(ms_c_state4_neon(v, i3, h3)), vld1q_f32(yg + 12));  \
+        acc[0] = vfmaq_f32(acc[0], ms_c_valuef4_neon(st[0]), vld1q_f32(yg +  0));                                       \
+        acc[1] = vfmaq_f32(acc[1], ms_c_valuef4_neon(st[1]), vld1q_f32(yg +  4));                                       \
+        acc[2] = vfmaq_f32(acc[2], ms_c_valuef4_neon(st[2]), vld1q_f32(yg +  8));                                       \
+        acc[3] = vfmaq_f32(acc[3], ms_c_valuef4_neon(st[3]), vld1q_f32(yg + 12));                                       \
     } while (0)
 
     GGML_MS_C_GROUP_NEON(head, 0);
@@ -4412,7 +4507,7 @@ static inline float ms_c_block_dot_neon(const int k, const uint8_t * GGML_RESTRI
         GGML_MS_C_GROUP_NEON(qs + 2*k*g - 2, g);
     }
     for (int g = gt; g < QK_MS/16; ++g) {
-        GGML_MS_C_GROUP_NEON(tail + 2*k*(g - gt), g);
+        GGML_MS_C_GROUP_NEON(pt + 2*k*(g - gt), g);
     }
 #undef GGML_MS_C_GROUP_NEON
 
@@ -4607,8 +4702,10 @@ static bool ms_c_rows_to_q8_0x4_neon(const int k, const int il, const void * GGM
     const block_ms_c##K * GGML_RESTRICT x = vx;                                                                         \
     const float * GGML_RESTRICT y = vy;                                                                                 \
     float sumf = 0.0f;                                                                                                  \
-    for (int i = 0; i < n / QK_MS; i++) {                                                                               \
-        const float sumb = ms_c_block_dot_neon(K, x[i].qs, x[i].s0 & GGML_MS_STATE_MASK, y + i*QK_MS);                \
+    const int nb = n / QK_MS;                                                                                           \
+    for (int i = 0; i < nb; i++) {                                                                                      \
+        const float sumb = i + 1 < nb ? ms_c_block_dot_neon(K, x[i].qs, y + i*QK_MS, false)                             \
+                                      : ms_c_block_dot_neon(K, x[i].qs, y + i*QK_MS, true);                             \
         sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * sumb;                                                                   \
     }                                                                                                                   \
     *s = sumf;
