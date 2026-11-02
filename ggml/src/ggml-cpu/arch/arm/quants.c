@@ -5200,10 +5200,11 @@ void ggml_vec_dot_ms_c_q8(int k, int n, float * GGML_RESTRICT s, const void * GG
 void ggml_vec_dot2_ms_c_q8(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy) {
     assert(n % QK_MS == 0);
 #if defined(GGML_MS_C_Q8_NEON) && GGML_MS_C_Q8_QK != 256
-    // two rows per pass gain for k = 4, 5 (fewer loads per weight where the extraction needs the most registers)
+    // two rows per pass gain for k = 4..6 (fewer loads per weight; for k = 1..3 the one-row kernel is faster)
     switch (k) {
         case 4: ms_c_vec_dot2_q8_neon(4, n, s, vx, bx, vy); return;
         case 5: ms_c_vec_dot2_q8_neon(5, n, s, vx, bx, vy); return;
+        case 6: ms_c_vec_dot2_q8_neon(6, n, s, vx, bx, vy); return;
         default: break;
     }
 #endif
