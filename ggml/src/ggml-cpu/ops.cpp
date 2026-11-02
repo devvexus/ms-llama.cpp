@@ -12466,6 +12466,97 @@ static void ggml_fwht_row_neon(float * x, const int64_t n) {
 }
 #endif
 
+#if defined(__AVX2__)
+// x86: as ggml_fwht_row_neon, with the first stages (1 .. W/2) inside each vector of W floats
+#if defined(__AVX512F__)
+#define GGML_FWHT_W 16
+typedef __m512 ggml_fwht_vec;
+static inline ggml_fwht_vec ggml_fwht_vload(const float * p) { return _mm512_loadu_ps(p); }
+static inline void ggml_fwht_vstore(float * p, ggml_fwht_vec v) { _mm512_storeu_ps(p, v); }
+static inline ggml_fwht_vec ggml_fwht_vadd(ggml_fwht_vec a, ggml_fwht_vec b) { return _mm512_add_ps(a, b); }
+static inline ggml_fwht_vec ggml_fwht_vsub(ggml_fwht_vec a, ggml_fwht_vec b) { return _mm512_sub_ps(a, b); }
+
+// stages 1, 2, 4 and 8 of 16 values: the lower element of each pair gets u + v, the upper one u - v, with u the lower and v the
+// upper input (s holds the partner of each element)
+static inline ggml_fwht_vec ggml_fwht_vstages(ggml_fwht_vec a) {
+    ggml_fwht_vec s;
+    s = _mm512_permute_ps(a, 0xB1);
+    a = _mm512_mask_sub_ps(_mm512_add_ps(a, s), 0xAAAA, s, a);
+    s = _mm512_permute_ps(a, 0x4E);
+    a = _mm512_mask_sub_ps(_mm512_add_ps(a, s), 0xCCCC, s, a);
+    s = _mm512_shuffle_f32x4(a, a, 0xB1);
+    a = _mm512_mask_sub_ps(_mm512_add_ps(a, s), 0xF0F0, s, a);
+    s = _mm512_shuffle_f32x4(a, a, 0x4E);
+    a = _mm512_mask_sub_ps(_mm512_add_ps(a, s), 0xFF00, s, a);
+    return a;
+}
+#else
+#define GGML_FWHT_W 8
+typedef __m256 ggml_fwht_vec;
+static inline ggml_fwht_vec ggml_fwht_vload(const float * p) { return _mm256_loadu_ps(p); }
+static inline void ggml_fwht_vstore(float * p, ggml_fwht_vec v) { _mm256_storeu_ps(p, v); }
+static inline ggml_fwht_vec ggml_fwht_vadd(ggml_fwht_vec a, ggml_fwht_vec b) { return _mm256_add_ps(a, b); }
+static inline ggml_fwht_vec ggml_fwht_vsub(ggml_fwht_vec a, ggml_fwht_vec b) { return _mm256_sub_ps(a, b); }
+
+// stages 1, 2 and 4 of 8 values (see the AVX-512 version)
+static inline ggml_fwht_vec ggml_fwht_vstages(ggml_fwht_vec a) {
+    ggml_fwht_vec s;
+    s = _mm256_permute_ps(a, 0xB1);
+    a = _mm256_blend_ps(_mm256_add_ps(a, s), _mm256_sub_ps(s, a), 0xAA);
+    s = _mm256_permute_ps(a, 0x4E);
+    a = _mm256_blend_ps(_mm256_add_ps(a, s), _mm256_sub_ps(s, a), 0xCC);
+    s = _mm256_permute2f128_ps(a, a, 0x01);
+    a = _mm256_blend_ps(_mm256_add_ps(a, s), _mm256_sub_ps(s, a), 0xF0);
+    return a;
+}
+#endif
+
+// NS stages (len, 2*len, 4*len) of the transform of x in one pass, on groups of 2^NS vectors at a stride of len
+template<int NS>
+static inline void ggml_fwht_pass_x86(float * x, const int64_t n, const int64_t len) {
+    constexpr int nv = 1 << NS;
+    for (int64_t i = 0; i < n; i += len*nv) {
+        for (int64_t j = 0; j < len; j += GGML_FWHT_W) {
+            ggml_fwht_vec v[nv];
+            for (int m = 0; m < nv; m++) {
+                v[m] = ggml_fwht_vload(x + i + j + m*len);
+            }
+            for (int st = 0; st < NS; st++) {
+                for (int m = 0; m < nv; m++) {
+                    if (m & (1 << st)) {
+                        continue;
+                    }
+                    const ggml_fwht_vec u = v[m];
+                    const ggml_fwht_vec w = v[m + (1 << st)];
+                    v[m]             = ggml_fwht_vadd(u, w);
+                    v[m + (1 << st)] = ggml_fwht_vsub(u, w);
+                }
+            }
+            for (int m = 0; m < nv; m++) {
+                ggml_fwht_vstore(x + i + j + m*len, v[m]);
+            }
+        }
+    }
+}
+
+// the transform of x (n >= GGML_FWHT_W) in place: the same sums and differences per element as the scalar and SIMD passes of
+// ggml_compute_forward_fwht_impl (so the same results), with the stages below GGML_FWHT_W inside each vector and then three per pass
+static void ggml_fwht_row_x86(float * x, const int64_t n) {
+    for (int64_t i = 0; i < n; i += GGML_FWHT_W) {
+        ggml_fwht_vstore(x + i, ggml_fwht_vstages(ggml_fwht_vload(x + i)));
+    }
+    for (int64_t len = GGML_FWHT_W; len < n; len *= 8) {
+        if (len*2 == n) {
+            ggml_fwht_pass_x86<1>(x, n, len);
+        } else if (len*4 == n) {
+            ggml_fwht_pass_x86<2>(x, n, len);
+        } else {
+            ggml_fwht_pass_x86<3>(x, n, len);
+        }
+    }
+}
+#endif
+
 template<typename src_t>
 static void ggml_compute_forward_fwht_impl(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -12508,6 +12599,12 @@ static void ggml_compute_forward_fwht_impl(const ggml_compute_params * params, g
 #if defined(__ARM_NEON) && defined(__aarch64__)
         if (n >= 16) {
             ggml_fwht_row_neon(dst_row, n);
+            continue;
+        }
+#endif
+#if defined(__AVX2__)
+        if (n >= GGML_FWHT_W) {
+            ggml_fwht_row_x86(dst_row, n);
             continue;
         }
 #endif
