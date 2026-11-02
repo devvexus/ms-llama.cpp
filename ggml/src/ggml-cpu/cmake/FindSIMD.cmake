@@ -28,6 +28,17 @@ set(AVX512_CODE "
     }
 ")
 
+set(AVX512_VNNI_CODE "
+    #include <immintrin.h>
+    int main(int argc, char ** argv)
+    {
+        (void) argv;
+        __m512i a = _mm512_set1_epi32(argc);
+        a = _mm512_dpbusd_epi32(a, a, a);
+        return _mm512_reduce_add_epi32(a) == 16*(argc + argc*argc) ? 0 : 1;
+    }
+")
+
 set(AVX2_CODE "
     #include <immintrin.h>
     int main()
@@ -97,4 +108,13 @@ if (NOT ${AVX512_FOUND})
     set(GGML_AVX512 OFF)
 else()
     set(GGML_AVX512 ON)
+endif()
+
+if (AVX512_FOUND)
+    check_sse("AVX512_VNNI" " ;/arch:AVX512")
+endif()
+if (AVX512_VNNI_FOUND)
+    set(GGML_AVX512_VNNI ON)
+else()
+    set(GGML_AVX512_VNNI OFF)
 endif()
