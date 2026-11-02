@@ -1653,3 +1653,8 @@ void ggml_vec_dot_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const v
 
     *s = sumf;
 }
+
+void ggml_vec_dot2_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy) {
+    ggml_vec_dot_ms_c_q8_generic(k, n, s + 0, vx, vy);
+    ggml_vec_dot_ms_c_q8_generic(k, n, s + 1, (const char *) vx + bx, vy);
+}

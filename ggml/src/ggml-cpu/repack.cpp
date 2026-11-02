@@ -5217,12 +5217,26 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
                 break;
             }
             const int64_t r1 = MIN(r0 + n, nr);
-            for (int64_t r = r0; r < MIN(r1, na); r++) {
-                ggml_vec_dot_ms_c_q8(k, (int) ne00, (float *) a->data + r, (const char *) a->src[0]->data + r*a->src[0]->nb[1], qa);
+            if (r0 < na) {
+                mv_rows(k, a, ne00, r0, MIN(r1, na), qa);
             }
-            for (int64_t r = MAX(r0, na); r < r1; r++) {
-                ggml_vec_dot_ms_c_q8(kb, (int) ne00, (float *) b->data + (r - na), (const char *) b->src[0]->data + (r - na)*b->src[0]->nb[1], qb);
+            if (r1 > na) {
+                mv_rows(kb, b, ne00, MAX(r0, na) - na, r1 - na, qb);
             }
+        }
+    }
+
+    // rows [i0, i1) of the mat-vec t (weights of kt bits), two at a time
+    static void mv_rows(int kt, struct ggml_tensor * t, int64_t ne00, int64_t i0, int64_t i1, const char * q) {
+        const char  * w  = (const char *) t->src[0]->data;
+        const size_t  nb = t->src[0]->nb[1];
+        float       * y  = (float *) t->data;
+        int64_t i = i0;
+        for (; i + 1 < i1; i += 2) {
+            ggml_vec_dot2_ms_c_q8(kt, (int) ne00, y + i, w + i*nb, nb, q);
+        }
+        if (i < i1) {
+            ggml_vec_dot_ms_c_q8(kt, (int) ne00, y + i, w + i*nb, q);
         }
     }
 

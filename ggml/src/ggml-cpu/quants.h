@@ -124,6 +124,9 @@ void ggml_ms_c_quantize_q8(int k, const float * GGML_RESTRICT x, void * GGML_RES
 // one row of n weights of k bits times a column quantized for k bits
 void ggml_vec_dot_ms_c_q8(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
 
+// the same for the two rows at vx and vx + bx: s[0] and s[1]
+void ggml_vec_dot2_ms_c_q8(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy);
+
 // Generic implementation
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -169,6 +172,7 @@ void ggml_ms_c_to_i16_generic(int k, const void * GGML_RESTRICT vx, int16_t * GG
 bool ggml_ms_c_to_q8_0x4_generic(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
 void ggml_ms_c_quantize_q8_generic(int k, const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, int64_t b0, int64_t b1);
 void ggml_vec_dot_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
+void ggml_vec_dot2_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy);
 
 #ifdef __cplusplus
 }
