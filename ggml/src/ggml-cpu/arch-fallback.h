@@ -43,6 +43,8 @@
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
 #define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
+#define ggml_ms_c_to_hl_x8_generic ggml_ms_c_to_hl_x8
+#define ggml_gemm_ms_c_hl_x8_q8_0_generic ggml_gemm_ms_c_hl_x8_q8_0
 #define ggml_ms_c_quantize_q8_generic ggml_ms_c_quantize_q8
 #define ggml_vec_dot_ms_c_q8_generic ggml_vec_dot_ms_c_q8
 #define ggml_vec_dot2_ms_c_q8_generic ggml_vec_dot2_ms_c_q8
@@ -104,6 +106,8 @@
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 // quants.c
 #define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
+#define ggml_ms_c_to_hl_x8_generic ggml_ms_c_to_hl_x8
+#define ggml_gemm_ms_c_hl_x8_q8_0_generic ggml_gemm_ms_c_hl_x8_q8_0
 #define ggml_ms_c_quantize_q8_generic ggml_ms_c_quantize_q8
 #define ggml_vec_dot_ms_c_q8_generic ggml_vec_dot_ms_c_q8
 #define ggml_vec_dot2_ms_c_q8_generic ggml_vec_dot2_ms_c_q8
@@ -155,6 +159,8 @@
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
 #define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
+#define ggml_ms_c_to_hl_x8_generic ggml_ms_c_to_hl_x8
+#define ggml_gemm_ms_c_hl_x8_q8_0_generic ggml_gemm_ms_c_hl_x8_q8_0
 #define ggml_ms_c_quantize_q8_generic ggml_ms_c_quantize_q8
 #define ggml_vec_dot_ms_c_q8_generic ggml_vec_dot_ms_c_q8
 #define ggml_vec_dot2_ms_c_q8_generic ggml_vec_dot2_ms_c_q8
@@ -220,6 +226,8 @@
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
 #define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
+#define ggml_ms_c_to_hl_x8_generic ggml_ms_c_to_hl_x8
+#define ggml_gemm_ms_c_hl_x8_q8_0_generic ggml_gemm_ms_c_hl_x8_q8_0
 #define ggml_ms_c_quantize_q8_generic ggml_ms_c_quantize_q8
 #define ggml_vec_dot_ms_c_q8_generic ggml_vec_dot_ms_c_q8
 #define ggml_vec_dot2_ms_c_q8_generic ggml_vec_dot2_ms_c_q8
@@ -279,6 +287,8 @@
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
 #define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
+#define ggml_ms_c_to_hl_x8_generic ggml_ms_c_to_hl_x8
+#define ggml_gemm_ms_c_hl_x8_q8_0_generic ggml_gemm_ms_c_hl_x8_q8_0
 #define ggml_ms_c_quantize_q8_generic ggml_ms_c_quantize_q8
 #define ggml_vec_dot_ms_c_q8_generic ggml_vec_dot_ms_c_q8
 #define ggml_vec_dot2_ms_c_q8_generic ggml_vec_dot2_ms_c_q8
@@ -348,6 +358,8 @@
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
 #define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
+#define ggml_ms_c_to_hl_x8_generic ggml_ms_c_to_hl_x8
+#define ggml_gemm_ms_c_hl_x8_q8_0_generic ggml_gemm_ms_c_hl_x8_q8_0
 #define ggml_ms_c_quantize_q8_generic ggml_ms_c_quantize_q8
 #define ggml_vec_dot_ms_c_q8_generic ggml_vec_dot_ms_c_q8
 #define ggml_vec_dot2_ms_c_q8_generic ggml_vec_dot2_ms_c_q8
@@ -417,6 +429,8 @@
 #define ggml_ms_c_to_f32_generic ggml_ms_c_to_f32
 #define ggml_ms_c_to_i16_generic ggml_ms_c_to_i16
 #define ggml_ms_c_to_q8_0x4_generic ggml_ms_c_to_q8_0x4
+#define ggml_ms_c_to_hl_x8_generic ggml_ms_c_to_hl_x8
+#define ggml_gemm_ms_c_hl_x8_q8_0_generic ggml_gemm_ms_c_hl_x8_q8_0
 #define ggml_ms_c_quantize_q8_generic ggml_ms_c_quantize_q8
 #define ggml_vec_dot_ms_c_q8_generic ggml_vec_dot_ms_c_q8
 #define ggml_vec_dot2_ms_c_q8_generic ggml_vec_dot2_ms_c_q8

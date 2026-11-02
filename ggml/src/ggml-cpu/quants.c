@@ -1566,6 +1566,79 @@ bool ggml_ms_c_to_q8_0x4_generic(int k, int il, const void * GGML_RESTRICT vx, s
     return true;
 }
 
+bool ggml_ms_c_to_hl_x8_generic(int k, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n) {
+    assert(n % QK_MS == 0);
+    assert(nr >= 1 && nr <= 8);
+
+    const size_t  bs = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8; // MS_C block
+    const int64_t nb = n/QK8_0;
+
+    float  * sc = (float *) vy;
+    int8_t * q  = (int8_t *) vy + (n/QK_MS)*32*sizeof(float);
+
+    int16_t v[QK_MS];
+    float   d;
+
+    memset(vy, 0, GGML_MS_C_HL_SIZE(n));
+    for (int r = 0; r < nr; r++) {
+        for (int64_t i = 0; i < n/QK_MS; i++) {
+            ggml_ms_c_to_i16(k, (const char *) vx + r*bx + i*bs, v, &d, QK_MS);
+            if (!(fabsf(d) <= 65504.0f/32)) {
+                return false;
+            }
+            float * si = sc + i*32 + (r/2)*4 + (r%2)*2;
+            si[0]  = si[1]  = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(32.0f*d));
+            si[16] = si[17] = d;
+            for (int e = 0; e < QK_MS; e++) {
+                // block of 32 (plane block of the hi plane, + nb for lo), step of 8, position in the step
+                int8_t * p = q + (i*(QK_MS/QK8_0) + e/32)*256 + ((e%32)/8)*64 + (r/2)*16 + (r%2)*8 + e%8;
+                const int u = v[e] + 512;
+                p[0]      = (int8_t) ((u >> 5) - 16);
+                p[nb*256] = (int8_t) (u & 31);
+            }
+        }
+    }
+
+    return true;
+}
+
+void ggml_gemm_ms_c_hl_x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n % QK_MS == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+
+    const int64_t nb = n/QK8_0;
+    const size_t  ys = 4*sizeof(ggml_half) + 4*QK8_0; // block_q8_0x4
+
+    for (int x = 0; x < nc; x += 8) {
+        const uint8_t * wg = (const uint8_t *) vx + (x/8)*GGML_MS_C_HL_SIZE(n);
+        const float   * sc = (const float *) wg;
+        const int8_t  * q  = (const int8_t *) (wg + (n/QK_MS)*32*sizeof(float));
+        for (int c = 0; c < nr; c++) {
+            const uint8_t * ac = (const uint8_t *) vy + (c/4)*nb*ys;
+            for (int r = 0; r < 8; r++) {
+                float sum = 0.0f;
+                for (int64_t pb = 0; pb < 2*nb; pb++) {
+                    const int64_t   j  = pb < nb ? pb : pb - nb;
+                    const uint8_t * a  = ac + j*ys;
+                    const int8_t  * aq = (const int8_t *) (a + 4*sizeof(ggml_half));
+                    const int8_t  * w  = q + pb*256 + (r/2)*16 + (r%2)*8;
+                    const float     dw = sc[(j/(QK_MS/QK8_0))*32 + (pb < nb ? 0 : 16) + (r/2)*4 + (r%2)*2];
+                    ggml_half dh;
+                    memcpy(&dh, a + (c%4)*sizeof(ggml_half), sizeof(dh));
+                    int32_t sumi = 0;
+                    for (int e = 0; e < QK8_0; e++) {
+                        sumi += w[(e/8)*64 + e%8]*aq[(e/8)*32 + (c%4)*8 + e%8];
+                    }
+                    const float p = dw*GGML_CPU_FP16_TO_FP32(dh);
+                    sum = fmaf((float) sumi, p, sum);
+                }
+                s[c*bs + x + r] = sum;
+            }
+        }
+    }
+}
+
 // order 0 for k = 1..4: even values first (the masked first bytes of k = 4), values j and j + 4 in the same lane of two vectors
 // (k <= 3); order 1 for k = 6: by i % 4, so the lanes of each vector start at the same bit offset; order 2 for k = 5: even values
 // first, values i and i + 8 (same bit offset) in the same lane of two vectors

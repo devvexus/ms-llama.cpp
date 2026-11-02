@@ -4695,6 +4695,212 @@ static bool ms_c_rows_to_q8_0x4_neon(const int k, const int il, const void * GGM
 
     return true;
 }
+
+// the 512 values of one block as row r of a group of 8 rows (ggml_ms_c_to_hl_x8; y[0] and y[1] = the block's first plane block
+// of hi and of lo), with v in [-510, 510]: ((v + 512) >> 5) - 16 = v >> 5 and (v + 512) & 31 = v & 31
+static inline void ms_c_block_to_hl_neon(const int k, const uint8_t * GGML_RESTRICT qs, const uint32_t s0, const int r, int8_t * GGML_RESTRICT y[2]) {
+    const uint8x16_t i0 = vld1q_u8(ms_c_tbl[k - 1] +  0);
+    const uint8x16_t i1 = vld1q_u8(ms_c_tbl[k - 1] + 16);
+    const uint8x16_t i2 = vld1q_u8(ms_c_tbl[k - 1] + 32);
+    const uint8x16_t i3 = vld1q_u8(ms_c_tbl[k - 1] + 48);
+    const int32x4_t  h0 = vld1q_s32(ms_c_shl[k - 1] +  0);
+    const int32x4_t  h1 = vld1q_s32(ms_c_shl[k - 1] +  4);
+    const int32x4_t  h2 = vld1q_s32(ms_c_shl[k - 1] +  8);
+    const int32x4_t  h3 = vld1q_s32(ms_c_shl[k - 1] + 12);
+
+    const int nq = QK_MS*k/8;
+    const int gt = k == 1 ? 26 : k == 2 ? 29 : k == 3 ? 30 : 31;
+    uint8_t head[16];
+    uint8_t tail[32] = { 0 };
+    head[0] = (uint8_t) (s0 >> 8);
+    head[1] = (uint8_t) s0;
+    memcpy(head + 2, qs, 14);
+    memcpy(tail, qs + 2*k*gt - 2, nq + 2 - 2*k*gt);
+
+    int8_t * yh = y[0] + (r/2)*16 + (r%2)*8;
+    int8_t * yl = y[1] + (r/2)*16 + (r%2)*8;
+
+    // group G is the first or second half of plane block G/2: steps 2*(G%2) and 2*(G%2) + 1
+#define GGML_MS_C_GROUP_HL_NEON(P, G)                                                                                   \
+    do {                                                                                                                \
+        const uint8x16_t b  = vld1q_u8(P);                                                                              \
+        const int32x4_t  v0 = ms_c_value4_neon(ms_c_state4_neon(b, i0, h0));                                            \
+        const int32x4_t  v1 = ms_c_value4_neon(ms_c_state4_neon(b, i1, h1));                                            \
+        const int32x4_t  v2 = ms_c_value4_neon(ms_c_state4_neon(b, i2, h2));                                            \
+        const int32x4_t  v3 = ms_c_value4_neon(ms_c_state4_neon(b, i3, h3));                                            \
+        const int16x8_t  w0 = vcombine_s16(vmovn_s32(v0), vmovn_s32(v1));                                               \
+        const int16x8_t  w1 = vcombine_s16(vmovn_s32(v2), vmovn_s32(v3));                                               \
+        const int8x16_t  lo = vandq_s8(vcombine_s8(vmovn_s16(w0), vmovn_s16(w1)), vdupq_n_s8(31));                      \
+        const size_t     o  = ((G)/2)*256 + ((G) % 2)*128;                                                              \
+        vst1_s8(yh + o +  0, vshrn_n_s16(w0, 5));                                                                       \
+        vst1_s8(yh + o + 64, vshrn_n_s16(w1, 5));                                                                       \
+        vst1_s8(yl + o +  0, vget_low_s8(lo));                                                                          \
+        vst1_s8(yl + o + 64, vget_high_s8(lo));                                                                         \
+    } while (0)
+
+    GGML_MS_C_GROUP_HL_NEON(head, 0);
+    for (int g = 1; g < gt; ++g) {
+        GGML_MS_C_GROUP_HL_NEON(qs + 2*k*g - 2, g);
+    }
+    for (int g = gt; g < QK_MS/16; ++g) {
+        GGML_MS_C_GROUP_HL_NEON(tail + 2*k*(g - gt), g);
+    }
+#undef GGML_MS_C_GROUP_HL_NEON
+}
+
+static bool ms_c_rows_to_hl_x8_neon(const int k, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n) {
+    const size_t  bs = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8; // MS_C block
+    const int64_t nb = n/QK8_0;
+
+    float  * sc = (float *) vy;
+    int8_t * q  = (int8_t *) vy + (n/QK_MS)*32*sizeof(float);
+
+    if (nr < 8) {
+        memset(vy, 0, GGML_MS_C_HL_SIZE(n));
+    }
+    for (int r = 0; r < nr; r++) {
+        for (int64_t i = 0; i < n/QK_MS; i++) {
+            const uint8_t * x = (const uint8_t *) vx + r*bx + i*bs;
+            ggml_half dh;
+            uint16_t  s0;
+            memcpy(&dh, x, sizeof(dh));
+            memcpy(&s0, x + sizeof(dh), sizeof(s0));
+            const float d = GGML_CPU_FP16_TO_FP32(dh);
+            if (!(fabsf(d) <= 65504.0f/32)) {
+                return false;
+            }
+            float * si = sc + i*32 + (r/2)*4 + (r%2)*2;
+            si[0]  = si[1]  = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(32.0f*d));
+            si[16] = si[17] = d;
+            const uint8_t * qs = x + sizeof(dh) + sizeof(s0);
+            const uint32_t  st = s0 & GGML_MS_STATE_MASK;
+            int8_t        * y[2] = { q + i*(QK_MS/QK8_0)*256, q + (nb + i*(QK_MS/QK8_0))*256 };
+            switch (k) {
+                case 1: ms_c_block_to_hl_neon(1, qs, st, r, y); break;
+                case 2: ms_c_block_to_hl_neon(2, qs, st, r, y); break;
+                case 3: ms_c_block_to_hl_neon(3, qs, st, r, y); break;
+                case 4: ms_c_block_to_hl_neon(4, qs, st, r, y); break;
+                case 5: ms_c_block_to_hl_neon(5, qs, st, r, y); break;
+                case 6: ms_c_block_to_hl_neon(6, qs, st, r, y); break;
+                default: GGML_ABORT("invalid MS_C bits");
+            }
+        }
+    }
+
+    return true;
+}
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+// the 2x2 sums of 8 rows x 4 columns over one block of 32 values of a plane: SMMLA of the 4 row pairs with the same two pairs of
+// columns ([r0 c0, r0 c1, r1 c0, r1 c1] of row pair i and column pair p)
+static inline void ms_c_hl_sums_neon(const int8_t * GGML_RESTRICT aq, const int8_t * GGML_RESTRICT w, int32x4_t sum[4][2]) {
+    for (int i = 0; i < 4; i++) {
+        sum[i][0] = sum[i][1] = vdupq_n_s32(0);
+    }
+    for (int t = 0; t < 4; t++) {
+        const int8x16_t a0 = vld1q_s8(aq + 32*t);
+        const int8x16_t a1 = vld1q_s8(aq + 32*t + 16);
+        for (int i = 0; i < 4; i++) {
+            const int8x16_t wi = vld1q_s8(w + 64*t + 16*i);
+            sum[i][0] = vmmlaq_s32(sum[i][0], wi, a0);
+            sum[i][1] = vmmlaq_s32(sum[i][1], wi, a1);
+        }
+    }
+}
+
+// the scale products of a block (the column scales as {d_c0, d_c1, d_c0, d_c1} and {d_c2, d_c3, d_c2, d_c3})
+static inline void ms_c_hl_scales_neon(const uint8_t * GGML_RESTRICT a, float32x4_t d[2]) {
+    const float32x4_t da = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) a)));
+    d[0] = vcombine_f32(vget_low_f32(da),  vget_low_f32(da));
+    d[1] = vcombine_f32(vget_high_f32(da), vget_high_f32(da));
+}
+
+// 8 rows x 4 columns at a time over the doubled row: per block of 32 values of a plane, per 2x2 sum one conversion, one product
+// of the two scales and one FMA, in the order and with the rounding of ggml_gemm_q8_0_4x8_q8_0 (so the same results); 8 rows share
+// each activation load. For n <= 4096 the products of the hi pass, fl(32*d_w*d_a) = 32*fl(d_w*d_a), are kept for the lo pass,
+// which converts its sums with 5 fraction bits (exact, |I| < 2^17): fma(I/32, 32*P, s) == fma(I, P, s)
+static void ms_c_gemm_hl_x8_neon(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int64_t nb   = n/QK8_0;
+    const size_t  ys   = 4*sizeof(ggml_half) + 4*QK8_0; // block_q8_0x4
+    const bool    keep = n <= 4096;
+
+    float32x4_t pk[4096/QK8_0][4][2];
+
+    for (int x = 0; x < nc; x += 8) {
+        const uint8_t * wg = (const uint8_t *) vx + (x/8)*GGML_MS_C_HL_SIZE(n);
+        const float   * sc = (const float *) wg;
+        const int8_t  * q  = (const int8_t *) (wg + (n/QK_MS)*32*sizeof(float));
+        for (int c = 0; c < nr; c += 4) {
+            const uint8_t * ac = (const uint8_t *) vy + (c/4)*nb*ys;
+
+            float32x4_t acc[4][2];
+            for (int i = 0; i < 4; i++) {
+                acc[i][0] = acc[i][1] = vdupq_n_f32(0.0f);
+            }
+
+            // the hi blocks
+            for (int64_t ib = 0; ib < n/QK_MS; ib++) {
+                float32x4_t dw[4];
+                for (int i = 0; i < 4; i++) {
+                    dw[i] = vld1q_f32(sc + ib*32 + 4*i);
+                }
+                for (int64_t j = ib*(QK_MS/QK8_0); j < (ib + 1)*(QK_MS/QK8_0); j++) {
+                    const uint8_t * a = ac + j*ys;
+                    int32x4_t   sum[4][2];
+                    float32x4_t d[2];
+                    ms_c_hl_sums_neon((const int8_t *) (a + 4*sizeof(ggml_half)), q + j*256, sum);
+                    ms_c_hl_scales_neon(a, d);
+                    for (int i = 0; i < 4; i++) {
+                        for (int p = 0; p < 2; p++) {
+                            const float32x4_t pr = vmulq_f32(dw[i], d[p]);
+                            if (keep) {
+                                pk[j][i][p] = pr;
+                            }
+                            acc[i][p] = vfmaq_f32(acc[i][p], vcvtq_f32_s32(sum[i][p]), pr);
+                        }
+                    }
+                }
+            }
+
+            // the lo blocks
+            for (int64_t ib = 0; ib < n/QK_MS; ib++) {
+                float32x4_t dw[4];
+                for (int i = 0; i < 4; i++) {
+                    dw[i] = keep ? vdupq_n_f32(0.0f) : vld1q_f32(sc + ib*32 + 16 + 4*i);
+                }
+                for (int64_t j = ib*(QK_MS/QK8_0); j < (ib + 1)*(QK_MS/QK8_0); j++) {
+                    const uint8_t * a = ac + j*ys;
+                    int32x4_t sum[4][2];
+                    ms_c_hl_sums_neon((const int8_t *) (a + 4*sizeof(ggml_half)), q + (nb + j)*256, sum);
+                    if (keep) {
+                        for (int i = 0; i < 4; i++) {
+                            for (int p = 0; p < 2; p++) {
+                                acc[i][p] = vfmaq_f32(acc[i][p], vcvtq_n_f32_s32(sum[i][p], 5), pk[j][i][p]);
+                            }
+                        }
+                    } else {
+                        float32x4_t d[2];
+                        ms_c_hl_scales_neon(a, d);
+                        for (int i = 0; i < 4; i++) {
+                            for (int p = 0; p < 2; p++) {
+                                acc[i][p] = vfmaq_f32(acc[i][p], vcvtq_f32_s32(sum[i][p]), vmulq_f32(dw[i], d[p]));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // columns c + 2p and c + 2p + 1, rows x .. x + 7
+            for (int p = 0; p < 2; p++) {
+                vst1q_f32(s + (c + 2*p + 0)*bs + x + 0, vuzp1q_f32(acc[0][p], acc[1][p]));
+                vst1q_f32(s + (c + 2*p + 0)*bs + x + 4, vuzp1q_f32(acc[2][p], acc[3][p]));
+                vst1q_f32(s + (c + 2*p + 1)*bs + x + 0, vuzp2q_f32(acc[0][p], acc[1][p]));
+                vst1q_f32(s + (c + 2*p + 1)*bs + x + 4, vuzp2q_f32(acc[2][p], acc[3][p]));
+            }
+        }
+    }
+}
 #endif
 
 #if defined(__aarch64__) && (defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_FEATURE_DOTPROD))
@@ -5168,6 +5374,27 @@ bool ggml_ms_c_to_q8_0x4(int k, int il, const void * GGML_RESTRICT vx, size_t bx
     return ms_c_rows_to_q8_0x4_neon(k, il, vx, bx, nr, vy, n);
 #else
     return ggml_ms_c_to_q8_0x4_generic(k, il, vx, bx, nr, vy, n);
+#endif
+}
+
+bool ggml_ms_c_to_hl_x8(int k, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n) {
+    assert(n % QK_MS == 0);
+    assert(nr >= 1 && nr <= 8);
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    return ms_c_rows_to_hl_x8_neon(k, vx, bx, nr, vy, n);
+#else
+    return ggml_ms_c_to_hl_x8_generic(k, vx, bx, nr, vy, n);
+#endif
+}
+
+void ggml_gemm_ms_c_hl_x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n % QK_MS == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+    ms_c_gemm_hl_x8_neon(n, s, bs, vx, vy, nr, nc);
+#else
+    ggml_gemm_ms_c_hl_x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 #endif
 }
 

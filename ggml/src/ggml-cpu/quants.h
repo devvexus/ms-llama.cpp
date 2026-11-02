@@ -101,6 +101,21 @@ void ggml_ms_c_to_i16(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTR
 // returns false, with vy incomplete, if a 32*d does not fit in FP16
 bool ggml_ms_c_to_q8_0x4(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
 
+// ggml_ms_c_to_q8_0x4's hi/lo split for groups of 8 rows: per block of QK_MS weights the scales as F32, {32*d_r0, 32*d_r0,
+// 32*d_r1, 32*d_r1} for each row pair, then the same with d (128 bytes per block, all blocks first); then the doubled row, 2*n/32
+// plane blocks of 256 bytes (hi for all n weights, then lo), each 4 steps of 8 weights x 4 row pairs of 16 bytes (rows 2i and
+// 2i + 1, 8 values each)
+#define GGML_MS_C_HL_SIZE(n) (((size_t) (n)/QK_MS)*32*sizeof(float) + ((size_t) (n)/32)*512)
+
+// nr <= 8 rows of n weights (row stride bx) to one group of 8 rows, missing rows are 0
+// returns false, with vy incomplete, if a 32*d does not fit in FP16
+bool ggml_ms_c_to_hl_x8(int k, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
+
+// s[c*bs + r] for nc rows (a multiple of 8, groups from ggml_ms_c_to_hl_x8) and nr columns (a multiple of 4, block_q8_0x4 from
+// ggml_quantize_mat_q8_0_4x8) of n values: the results of ggml_gemm_q8_0_4x8_q8_0 over the doubled row of ggml_ms_c_to_q8_0x4,
+// s = fma(I, d_w*d_a, s) per block of 32 values of a plane with the exact integer sum I, all hi blocks first, from s = 0
+void ggml_gemm_ms_c_hl_x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+
 // MS_C mat-vec with int8 activations: the F32 column is quantized to int8 in blocks of GGML_MS_C_Q8_QK values with one F32
 // scale each, and stored in the lane order of the k-bit kernel; the integer dot product of each block is exact
 #ifndef GGML_MS_C_Q8_QK
@@ -170,6 +185,8 @@ void ggml_vec_dot_ms_c6_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 void ggml_ms_c_to_f32_generic(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n);
 void ggml_ms_c_to_i16_generic(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n);
 bool ggml_ms_c_to_q8_0x4_generic(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
+bool ggml_ms_c_to_hl_x8_generic(int k, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
+void ggml_gemm_ms_c_hl_x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_ms_c_quantize_q8_generic(int k, const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, int64_t b0, int64_t b1);
 void ggml_vec_dot_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
 void ggml_vec_dot2_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy);
