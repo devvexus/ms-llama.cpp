@@ -6,6 +6,13 @@
 namespace ggml::cpu {
 tensor_traits::~tensor_traits() {}
 
+bool tensor_traits::compute_forward_pair(const struct ggml_compute_params * params, struct ggml_tensor * a, struct ggml_tensor * b) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(a);
+    GGML_UNUSED(b);
+    return false;
+}
+
 extra_buffer_type::~extra_buffer_type() {}
 }  // namespace ggml::cpu
 
@@ -28,6 +35,19 @@ bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size
             auto buf_extra     = (ggml::cpu::extra_buffer_type *) extra->context;
             auto tensor_traits = buf_extra->get_tensor_traits(op);
             if (tensor_traits && tensor_traits->work_size(n_threads, op, *size)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool ggml_cpu_extra_compute_forward_pair(const struct ggml_compute_params * params, struct ggml_tensor * a, struct ggml_tensor * b) {
+    for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (extra && extra->context) {
+            auto buf_extra     = (ggml::cpu::extra_buffer_type *) extra->context;
+            auto tensor_traits = buf_extra->get_tensor_traits(a);
+            if (tensor_traits && tensor_traits->compute_forward_pair(params, a, b)) {
                 return true;
             }
         }

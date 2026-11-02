@@ -677,6 +677,10 @@ int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
     return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
 }
 
+int ggml_threadpool_chunk_get(struct ggml_threadpool * tp) {
+    return atomic_load_explicit(&tp->current_chunk, memory_order_relaxed);
+}
+
 #if defined(__gnu_linux__)
 static cpu_set_t ggml_get_numa_affinity(void) {
     cpu_set_t cpuset;
@@ -3389,8 +3393,15 @@ static int ggml_cpu_try_fuse_ops(
             j++;
         }
         if (j < cgraph->n_nodes && ggml_cpu_mul_mat_vec_can_share(node, cgraph->nodes[j])) {
-            ggml_compute_forward_mul_mat_vec_pair(params, node, cgraph->nodes[j]);
-            return j - node_n;
+            if (ggml_cpu_extra_compute_forward_pair(params, node, cgraph->nodes[j])) {
+                return j - node_n;
+            }
+            // the default MUL_MAT for both, unless an extra buffer type computes one of them
+            size_t ws;
+            if (!ggml_cpu_extra_work_size(params->nth, node, &ws) && !ggml_cpu_extra_work_size(params->nth, cgraph->nodes[j], &ws)) {
+                ggml_compute_forward_mul_mat_vec_pair(params, node, cgraph->nodes[j]);
+                return j - node_n;
+            }
         }
     }
 

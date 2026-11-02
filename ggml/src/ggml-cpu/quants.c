@@ -1565,3 +1565,91 @@ bool ggml_ms_c_to_q8_0x4_generic(int k, int il, const void * GGML_RESTRICT vx, s
 
     return true;
 }
+
+// order 0 for k = 1..4: even values first (the masked first bytes of k = 4), values j and j + 4 in the same lane of two vectors
+// (k <= 3); order 1 for k = 6: by i % 4, so the lanes of each vector start at the same bit offset; order 2 for k = 5: even values
+// first, values i and i + 8 (same bit offset) in the same lane of two vectors
+const uint8_t ggml_ms_c_q8_order_tbl[3][16] = {
+    { 0, 2, 8, 10, 4, 6, 12, 14, 1, 3, 9, 11, 5, 7, 13, 15 },
+    { 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15 },
+    { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 },
+};
+
+// column layout: q[4*n] (value p of the column at bytes 4p .. 4p + 3), c[n/GGML_MS_C_Q8_QK][4] = { -510*(sum of the block's q), 0, 0, 0 },
+// d[n/GGML_MS_C_Q8_QK]; q = round(x/d) to nearest even with d = amax/127
+void ggml_ms_c_quantize_q8_generic(int k, const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, int64_t b0, int64_t b1) {
+    assert(n % QK_MS == 0);
+
+    int8_t  * q = (int8_t *) vy;
+    int32_t * c = (int32_t *) (q + 4*n);
+    float   * d = (float *) (c + 4*(n/GGML_MS_C_Q8_QK));
+
+    const uint8_t * ord = ggml_ms_c_q8_order_tbl[ggml_ms_c_q8_order(k)];
+
+    for (int64_t b = b0; b < b1; b++) {
+        const float * xb = x + b*GGML_MS_C_Q8_QK;
+
+        float amax = 0.0f;
+        for (int j = 0; j < GGML_MS_C_Q8_QK; j++) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+        const float db = amax / 127.0f;
+        const float id = db ? 1.0f/db : 0.0f;
+
+        int sum = 0;
+        for (int j = 0; j < GGML_MS_C_Q8_QK; j++) {
+            const int8_t a = (int8_t) nearbyintf(xb[(j & ~15) + ord[j & 15]]*id);
+            memset(q + 4*(b*GGML_MS_C_Q8_QK + j), a, 4);
+            sum += a;
+        }
+
+        c[4*b + 0] = -510*sum;
+        c[4*b + 1] = 0;
+        c[4*b + 2] = 0;
+        c[4*b + 3] = 0;
+        d[b] = db;
+    }
+}
+
+// per block of the column the exact integer sum of value*q, then (with nab blocks per MS_C block) F[b % 4] += sum*d[b] for nab >= 4
+// or F[b] = sum*d[b] for nab = 2, and sumf += d * ((F[0] + F[1]) + (F[2] + F[3]))
+void ggml_vec_dot_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    assert(n % QK_MS == 0);
+    static_assert(GGML_MS_C_Q8_QK == 32 || GGML_MS_C_Q8_QK == 64 || GGML_MS_C_Q8_QK == 128 || GGML_MS_C_Q8_QK == 256, "invalid GGML_MS_C_Q8_QK");
+
+    const int nab = QK_MS/GGML_MS_C_Q8_QK;
+    const size_t bs = sizeof(ggml_half) + sizeof(uint16_t) + k*QK_MS/8;
+
+    const int8_t  * q = (const int8_t *) vy;
+    const int32_t * c = (const int32_t *) (q + 4*(int64_t) n);
+    const float   * d = (const float *) (c + 4*(n/GGML_MS_C_Q8_QK));
+
+    const uint8_t * ord = ggml_ms_c_q8_order_tbl[ggml_ms_c_q8_order(k)];
+
+    int16_t v[QK_MS];
+    float   dw;
+    float   sumf = 0.0f;
+
+    for (int i = 0; i < n/QK_MS; i++) {
+        ggml_ms_c_to_i16(k, (const char *) vx + i*bs, v, &dw, QK_MS);
+
+        float F[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int b = 0; b < nab; b++) {
+            const int ib = i*nab + b;
+            int32_t sum = c[4*ib];
+            for (int j = 0; j < GGML_MS_C_Q8_QK; j++) {
+                const int p = b*GGML_MS_C_Q8_QK + j;
+                sum += (v[(p & ~15) + ord[p & 15]] + 510) * q[4*(i*QK_MS + p)];
+            }
+            if (nab == 2) {
+                F[b] = (float) sum * d[ib];
+            } else {
+                F[b % 4] = fmaf((float) sum, d[ib], F[b % 4]);
+            }
+        }
+        const float sumb = nab == 2 ? F[0] + F[1] : (F[0] + F[1]) + (F[2] + F[3]);
+        sumf += dw * sumb;
+    }
+
+    *s = sumf;
+}

@@ -5105,10 +5105,13 @@ class tensor_traits_ms_c : public tensor_traits_base {
     }
 };
 
-// MS_C keeps its block layout. MUL_MAT with 16 or more src1 columns (prompt batches; token generation keeps the exact F32
-// vec_dot) writes each tile of src0 rows as Q8_0 blocks along a doubled row:
+// MS_C keeps its block layout. MUL_MAT with 16 or more src1 columns (prompt batches) writes each tile of src0 rows as Q8_0 blocks
+// along a doubled row:
 // v = 32*hi + lo, the hi blocks with scale 32*d, then the lo blocks with scale d. src1 is quantized to Q8_0 and repeated along the
-// doubled row, so the Q8_0 GEMM (4x8 with i8mm, 4x4 with dotprod) gives the sum of d*v*a. Other cases use the default MUL_MAT.
+// doubled row, so the Q8_0 GEMM (4x8 with i8mm, 4x4 with dotprod) gives the sum of d*v*a.
+// MUL_MAT with one src1 column (token generation) quantizes it with ggml_ms_c_quantize_q8 and runs ggml_vec_dot_ms_c_q8 on ranges
+// of rows taken from a shared counter, also for two mat-vecs of the same column (compute_forward_pair).
+// Other cases use the default MUL_MAT (exact F32 activations), as do weights outside CPU_REPACK buffers.
 class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
   public:
     tensor_traits_ms_c_q8_0(int bits, int il) : k(bits), il(il) {}
@@ -5160,7 +5163,74 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
         }
     }
 
+    static bool use_mv(const struct ggml_tensor * op) {
+        const ggml_tensor * src1 = op->src[1];
+        return op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float) &&
+               src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+               src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
+    }
+
+    // the quantized column in both lane orders (for two mat-vecs of weights with different orders)
+    static size_t mv_wsize(const struct ggml_tensor * op) {
+        return CACHE_LINE_SIZE + 2*GGML_PAD(GGML_MS_C_Q8_SIZE(op->src[0]->ne[0]), CACHE_LINE_SIZE);
+    }
+
+    // the rows of a, then those of b (if not null; same src1 as a, MS_C weights of kb bits)
+    void compute_mv(const struct ggml_compute_params * params, struct ggml_tensor * a, struct ggml_tensor * b, int kb) const {
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        const int64_t ne00 = a->src[0]->ne[0];
+        const int64_t na   = a->ne[0];
+        const int64_t nr   = na + (b ? b->ne[0] : 0);
+        const bool    two  = ggml_ms_c_q8_order(kb) != ggml_ms_c_q8_order(k);
+
+        char * qa = (char *) GGML_PAD((uintptr_t) params->wdata, CACHE_LINE_SIZE);
+        char * qb = two ? qa + GGML_PAD(GGML_MS_C_Q8_SIZE(ne00), CACHE_LINE_SIZE) : qa;
+
+        // each thread quantizes a range of blocks of the column
+        const float * x  = (const float *) a->src[1]->data;
+        const int64_t nq = ne00/GGML_MS_C_Q8_QK;
+        ggml_ms_c_quantize_q8(k, x, qa, ne00, nq*ith/nth, nq*(ith + 1)/nth);
+        if (two) {
+            ggml_ms_c_quantize_q8(kb, x, qb, ne00, nq*ith/nth, nq*(ith + 1)/nth);
+        }
+
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, 0);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // as the one-column case of the default MUL_MAT: each range is 1/(4*nth) of the rows left, and at least about 16K weights
+        // (or 1/nth of the rows of a small matrix)
+        const int64_t min_rows = MAX(1, MIN(16384/ne00, (nr + nth - 1)/nth));
+
+        for (;;) {
+            const int64_t left = nr - ggml_threadpool_chunk_get(params->threadpool);
+            if (left <= 0) {
+                break;
+            }
+            const int64_t n  = MAX(min_rows, left/(4*nth));
+            const int64_t r0 = ggml_threadpool_chunk_add(params->threadpool, (int) n);
+            if (r0 >= nr) {
+                break;
+            }
+            const int64_t r1 = MIN(r0 + n, nr);
+            for (int64_t r = r0; r < MIN(r1, na); r++) {
+                ggml_vec_dot_ms_c_q8(k, (int) ne00, (float *) a->data + r, (const char *) a->src[0]->data + r*a->src[0]->nb[1], qa);
+            }
+            for (int64_t r = MAX(r0, na); r < r1; r++) {
+                ggml_vec_dot_ms_c_q8(kb, (int) ne00, (float *) b->data + (r - na), (const char *) b->src[0]->data + (r - na)*b->src[0]->nb[1], qb);
+            }
+        }
+    }
+
     bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+        if (use_mv(op)) {
+            size = mv_wsize(op);
+            return true;
+        }
         if (!use_q8_0(op)) {
             return false;
         }
@@ -5168,7 +5238,24 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
         return true;
     }
 
+    // a uses these traits. A b in a CPU_REPACK buffer with an MS_C type has the same kind of traits (MS_C types get them
+    // from the CPU features alone).
+    bool compute_forward_pair(const struct ggml_compute_params * params, struct ggml_tensor * a, struct ggml_tensor * b) override {
+        const ggml_tensor * wb = b->src[0];
+        if (params->use_ref || !use_mv(a) || !use_mv(b) || b->src[1] != a->src[1] || params->wsize < mv_wsize(a) ||
+            ggml_ms_c_bits(wb->type) <= 0 || !wb->buffer || wb->buffer->buft != ggml_backend_cpu_repack_buffer_type() || !wb->extra ||
+            wb->ne[0] != a->src[0]->ne[0] || wb->ne[2] != 1 || wb->ne[3] != 1) {
+            return false;
+        }
+        compute_mv(params, a, b, ggml_ms_c_bits(wb->type));
+        return true;
+    }
+
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+        if (!params->use_ref && use_mv(op) && params->wsize >= mv_wsize(op)) {
+            compute_mv(params, op, nullptr, k);
+            return true;
+        }
         if (params->use_ref || !use_q8_0(op) || params->wsize < wsize(op, params->nth)) {
             return false;
         }

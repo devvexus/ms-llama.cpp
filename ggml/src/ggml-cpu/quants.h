@@ -101,6 +101,29 @@ void ggml_ms_c_to_i16(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTR
 // returns false, with vy incomplete, if a 32*d does not fit in FP16
 bool ggml_ms_c_to_q8_0x4(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
 
+// MS_C mat-vec with int8 activations: the F32 column is quantized to int8 in blocks of GGML_MS_C_Q8_QK values with one F32
+// scale each, and stored in the lane order of the k-bit kernel; the integer dot product of each block is exact
+#ifndef GGML_MS_C_Q8_QK
+#define GGML_MS_C_Q8_QK 32
+#endif
+
+// bytes of a quantized column of n values: each value 4 times, then per block an int32x4 start value and the scale
+#define GGML_MS_C_Q8_SIZE(n) (4*(size_t) (n) + ((size_t) (n)/GGML_MS_C_Q8_QK)*(4*sizeof(int32_t) + sizeof(float)))
+
+// position p of each group of 16 values of a quantized column holds value ggml_ms_c_q8_order_tbl[o][p] of the group, with
+// o = ggml_ms_c_q8_order(k) for weights of k bits; weights with the same o can share a quantized column
+extern const uint8_t ggml_ms_c_q8_order_tbl[3][16];
+
+static inline int ggml_ms_c_q8_order(int k) {
+    return k == 6 ? 1 : k == 5 ? 2 : 0;
+}
+
+// blocks [b0, b1) of the quantized column of the n values x, for weights of k bits
+void ggml_ms_c_quantize_q8(int k, const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, int64_t b0, int64_t b1);
+
+// one row of n weights of k bits times a column quantized for k bits
+void ggml_vec_dot_ms_c_q8(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
+
 // Generic implementation
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -144,6 +167,8 @@ void ggml_vec_dot_ms_c6_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 void ggml_ms_c_to_f32_generic(int k, const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t n);
 void ggml_ms_c_to_i16_generic(int k, const void * GGML_RESTRICT vx, int16_t * GGML_RESTRICT v, float * GGML_RESTRICT d, int64_t n);
 bool ggml_ms_c_to_q8_0x4_generic(int k, int il, const void * GGML_RESTRICT vx, size_t bx, int nr, void * GGML_RESTRICT vy, int64_t n);
+void ggml_ms_c_quantize_q8_generic(int k, const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, int64_t b0, int64_t b1);
+void ggml_vec_dot_ms_c_q8_generic(int k, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
 
 #ifdef __cplusplus
 }
