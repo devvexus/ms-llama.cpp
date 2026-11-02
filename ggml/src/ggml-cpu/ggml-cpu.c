@@ -1385,9 +1385,12 @@ UseGgmlGemm1:;
     #endif
     }
 
+    // one src1 column: the threads take ranges of rows from a shared row counter (below)
+    const bool mv_rows = nth > 1 && ne1*ne2*ne3 == 1 && !ggml_is_numa();
+
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        atomic_store_explicit(&params->threadpool->current_chunk, mv_rows ? 0 : nth, memory_order_relaxed);
     }
 
     ggml_barrier(params->threadpool);
@@ -1415,6 +1418,27 @@ UseGgmlGemm1:;
     }
 UseGgmlGemm2:;
 #endif
+
+    if (mv_rows) {
+        // each range is 1/(4*nth) of the rows left, and at least about 16K weights (or 1/nth of the rows of a small matrix):
+        // the ranges get smaller towards the end, so the threads finish at about the same time even when some of them run
+        // on slower cores (e.g. the efficiency cores of a hybrid CPU)
+        const int64_t min_rows = MAX(1, MIN(16384/ne00, (ne0 + nth - 1)/nth));
+
+        for (;;) {
+            const int64_t left = ne0 - atomic_load_explicit(&params->threadpool->current_chunk, memory_order_relaxed);
+            if (left <= 0) {
+                break;
+            }
+            const int64_t n  = MAX(min_rows, left/(4*nth));
+            const int64_t r0 = atomic_fetch_add_explicit(&params->threadpool->current_chunk, (int) n, memory_order_relaxed);
+            if (r0 >= ne0) {
+                break;
+            }
+            ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, 1, r0, MIN(r0 + n, ne0), 0, 1);
+        }
+        return;
+    }
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
