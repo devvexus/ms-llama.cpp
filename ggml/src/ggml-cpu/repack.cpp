@@ -5215,6 +5215,27 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
 
         ggml_barrier(params->threadpool);
 
+        // rows [r0, r1) of a, then of b
+        const auto rows = [&](int64_t r0, int64_t r1) {
+            if (r0 < na) {
+                mv_rows(k, a, ne00, r0, MIN(r1, na), qa);
+            }
+            if (r1 > na) {
+                mv_rows(kb, b, ne00, MAX(r0, na) - na, r1 - na, qb);
+            }
+        };
+
+        if (ggml_is_numa()) {
+            // one fixed range of rows per thread, as the default MUL_MAT does on NUMA
+            const int64_t dr = (nr + nth - 1)/nth;
+            const int64_t r0 = MIN(dr*ith, nr);
+            const int64_t r1 = MIN(r0 + dr, nr);
+            if (r0 < r1) {
+                rows(r0, r1);
+            }
+            return;
+        }
+
         // each range is 1/(2*nth) of the rows left, twice that for a thread on a performance core of a hybrid CPU (about twice
         // as fast here), and at least about 16K weights (or 1/nth of the rows of a small matrix)
         const int64_t min_rows = MAX(1, MIN(16384/ne00, (nr + nth - 1)/nth));
@@ -5229,13 +5250,7 @@ class tensor_traits_ms_c_q8_0 : public tensor_traits_base {
             if (r0 >= nr) {
                 break;
             }
-            const int64_t r1 = MIN(r0 + n, nr);
-            if (r0 < na) {
-                mv_rows(k, a, ne00, r0, MIN(r1, na), qa);
-            }
-            if (r1 > na) {
-                mv_rows(kb, b, ne00, MAX(r0, na) - na, r1 - na, qb);
-            }
+            rows(r0, MIN(r0 + n, nr));
         }
     }
 
