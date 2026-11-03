@@ -2609,7 +2609,7 @@ static void ggml_compute_forward_silu_f32(
                 (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01) + c0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = c0; k < c1; k++) {
             const float x = ((float *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*(dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -3307,7 +3307,7 @@ static void ggml_compute_forward_swiglu_f32(
         ggml_vec_swiglu_f32(c1 - c0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + c0, src0_p + c0, src1_p + c0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = c0; k < c1; k++) {
             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
