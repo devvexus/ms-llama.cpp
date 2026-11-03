@@ -5108,7 +5108,7 @@ class tensor_traits_ms_c : public tensor_traits_base {
 // MS_C keeps its block layout. MUL_MAT with 16 or more src1 columns (prompt batches) quantizes src1 to Q8_0 and decodes each range
 // of src0 rows once into the two int8 planes of v = 32*hi + lo along a doubled row, the hi blocks with scale 32*d, then the lo
 // blocks with scale d. With i8mm, groups of 8 rows (ggml_ms_c_to_hl_x8) and ggml_gemm_ms_c_hl_x8_q8_0, which loads each block of
-// src1 once for both planes and 8 rows; with dotprod only, Q8_0 blocks of 4 rows (ggml_ms_c_to_q8_0x4) and the Q8_0 GEMM (4x4)
+// src1 once per plane for all 8 rows; with dotprod only, Q8_0 blocks of 4 rows (ggml_ms_c_to_q8_0x4) and the Q8_0 GEMM (4x4)
 // with src1 repeated along the doubled row. Both give the sum of d*v*a with the same results.
 // MUL_MAT with one src1 column (token generation) quantizes it with ggml_ms_c_quantize_q8 and runs ggml_vec_dot_ms_c_q8 on ranges
 // of rows taken from a shared counter, also for two mat-vecs of the same column (compute_forward_pair).
