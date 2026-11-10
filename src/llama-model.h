@@ -718,6 +718,7 @@ struct llama_hadamard {
 };
 
 // token embedding stored as two tables: the first n_hi stored rows in token_embd, the other rows in token_embd_lo
+// the output head of an untied model can be split the same way: the first stored rows in output, the other rows in output_lo
 // stored row i is the token order[i]; the index tensors are made in load_tensors_emb_split
 struct llama_emb_split {
     int64_t n_hi = 0; // 0 if the table is not split
@@ -726,7 +727,7 @@ struct llama_emb_split {
     std::vector<int32_t> order;
 
     ggml_tensor * tok_lo = nullptr; // token_embd_lo for the lookup
-    ggml_tensor * out_lo = nullptr; // token_embd_lo for the output head
+    ggml_tensor * out_lo = nullptr; // low rows of the output head: token_embd_lo (tied) or output_lo (untied), nullptr if the head is not split
 
     // tables read by the lookup: the output head copies if they are in device memory, else tok_embd and tok_lo
     ggml_tensor * lookup_hi = nullptr;

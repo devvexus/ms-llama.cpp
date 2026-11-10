@@ -2190,6 +2190,9 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             if (name == "output.weight") {
                 return true; // the output head is built through build_lora_mm in every arch
             }
+            if (name == "output_lo.weight") {
+                return true; // the low rows of a split head, built through build_lora_mm in build_split_head
+            }
             if (name.compare(0, 4, "blk.") != 0) {
                 return false;
             }
@@ -2271,6 +2274,11 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
         hdmd.weight_blocks.emplace("token_embd.weight", it->second);
     } else if (hdmd.inverse_blocks.count("token_embd.weight") && !ml.get_weight("output.weight")) {
         throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
+    }
+
+    // each half of a split head has its own transform, a half without one would give wrong logits for its rows
+    if (ml.get_weight("output_lo.weight") && hdmd.weight_blocks.count("output.weight") != hdmd.weight_blocks.count("output_lo.weight")) {
+        throw std::runtime_error("prism.hadamard: list both output.weight and output_lo.weight in weight_names, or neither");
     }
 }
 
@@ -2457,21 +2465,24 @@ void llama_model_base::load_tensors_hadamard() {
 }
 
 // the lookup tables go on the buffer type of the tables they index, the logit permutation on the buffer type of the output
+// a split table always has a split head (its tied output), an untied output can split only its head (output + output_lo)
 void llama_model_base::load_tensors_emb_split() {
     auto & es = emb_split;
-    if (es.n_hi == 0) {
+    if (es.out_lo == nullptr) {
         return;
     }
-    if (!tok_embd || !output || !es.tok_lo || !es.out_lo || !tok_embd->buffer || !output->buffer) {
+    const bool split_table = es.n_hi > 0;
+    if (!output || !output->buffer || (split_table && (!tok_embd || !es.tok_lo || !tok_embd->buffer))) {
         throw std::runtime_error("split token embedding: tensors are not loaded");
     }
-    const int64_t n_vocab = es.n_hi + es.n_lo;
-    if ((int64_t) es.order.size() != n_vocab) {
+    const int64_t n_vocab = output->ne[1] + es.out_lo->ne[1];
+    if ((int64_t) es.order.size() != n_vocab || (split_table && es.n_hi + es.n_lo != n_vocab)) {
         throw std::runtime_error("split token embedding: bad order length");
     }
 
-    // both output tables read the same transformed input
-    if (const auto it = hdmd.rot.find(output); it != hdmd.rot.end()) {
+    // both output tables of a split table read the same transformed input
+    // (the two halves of an untied split head are listed in prism.hadamard on their own)
+    if (const auto it = hdmd.rot.find(output); split_table && it != hdmd.rot.end()) {
         hdmd.rot.emplace(es.out_lo, it->second);
     }
 
@@ -2497,7 +2508,7 @@ void llama_model_base::load_tensors_emb_split() {
         ggml_tensor * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
         return ggml_backend_dev_supports_op(dev, ggml_get_rows(ctx.get(), table, ids));
     };
-    const bool out_on_device = device_get_rows(output) && device_get_rows(es.out_lo);
+    const bool out_on_device = split_table && device_get_rows(output) && device_get_rows(es.out_lo);
     es.lookup_hi = out_on_device ? output    : tok_embd;
     es.lookup_lo = out_on_device ? es.out_lo : es.tok_lo;
 
@@ -2580,19 +2591,26 @@ void llama_model_base::load_tensors_emb_split() {
         pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
     };
 
-    make(es.lookup_hi, {
-        { &es.in_hidx,  "emb_split.hidx",  GGML_TYPE_I32, hidx.data()  },
-        { &es.in_lidx,  "emb_split.lidx",  GGML_TYPE_I32, lidx.data()  },
-        { &es.in_hmask, "emb_split.hmask", GGML_TYPE_F32, hmask.data() },
-        { &es.in_lmask, "emb_split.lmask", GGML_TYPE_F32, lmask.data() },
-    });
+    if (split_table) {
+        make(es.lookup_hi, {
+            { &es.in_hidx,  "emb_split.hidx",  GGML_TYPE_I32, hidx.data()  },
+            { &es.in_lidx,  "emb_split.lidx",  GGML_TYPE_I32, lidx.data()  },
+            { &es.in_hmask, "emb_split.hmask", GGML_TYPE_F32, hmask.data() },
+            { &es.in_lmask, "emb_split.lmask", GGML_TYPE_F32, lmask.data() },
+        });
+    }
     make(output, {
         { &es.out_inv, "emb_split.inv",   GGML_TYPE_I32, inv.data()      },
         { &es.out_ord, "emb_split.order", GGML_TYPE_I32, es.order.data() },
     });
 
-    LLAMA_LOG_INFO("%s: split token embedding: %lld + %lld rows (%s + %s)\n", __func__,
-            (long long) es.n_hi, (long long) es.n_lo, ggml_type_name(tok_embd->type), ggml_type_name(es.tok_lo->type));
+    if (split_table) {
+        LLAMA_LOG_INFO("%s: split token embedding: %lld + %lld rows (%s + %s)\n", __func__,
+                (long long) es.n_hi, (long long) es.n_lo, ggml_type_name(tok_embd->type), ggml_type_name(es.tok_lo->type));
+    } else {
+        LLAMA_LOG_INFO("%s: split head: %lld + %lld rows (%s + %s)\n", __func__,
+                (long long) output->ne[1], (long long) es.out_lo->ne[1], ggml_type_name(output->type), ggml_type_name(es.out_lo->type));
+    }
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

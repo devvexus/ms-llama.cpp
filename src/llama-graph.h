@@ -1114,7 +1114,7 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
-    // output head of a split token embedding (w holds the high rows): logits of both tables, in token order
+    // split output head (w holds the high rows, split.out_lo the others): logits of both tables, in token order
     ggml_tensor * build_split_head(ggml_tensor * w, const llama_emb_split & split, ggml_tensor * cur) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale

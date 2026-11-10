@@ -1681,7 +1681,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 }
 
 ggml_tensor * llm_graph_context::build_split_head(ggml_tensor * w, const llama_emb_split & split, ggml_tensor * cur) const {
-    // both tables have the same transform, so build_hadamard_input makes the transformed input once
+    // build_hadamard_input makes the transformed input once per transform, and both tables usually have the same one
     ggml_tensor * hi = build_lora_mm(w, cur);
     ggml_tensor * lo = build_lora_mm(split.out_lo, cur);
 
