@@ -30,6 +30,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmms.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1677,7 +1678,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
     ggml_type compute_type = src0->type;
-    if (ggml_is_quantized(compute_type)) {
+    if (ggml_cuda_type_is_ms_c(compute_type)) {
+        // MS_C without the tensor core kernel (mmms): f32, f16 overflows for large activations and its sums cost about 4e-4 KLD
+        compute_type = GGML_TYPE_F32;
+    } else if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
         compute_type = GGML_TYPE_F32;
@@ -1717,7 +1721,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);
 
     if (compute_type == GGML_TYPE_F32 &&
-            (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+            (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_cuda_type_is_ms_c(src0->type)) &&
             src0_f32_size > max_src0_convert_size) {
         const size_t f32_row_size = src0_f32_size / src0->ne[1];
         const int64_t rows_per_chunk = std::max<int64_t>(1, (int64_t) (max_src0_convert_size / f32_row_size));
@@ -2064,6 +2068,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_should_use_mmms(src0->type, cc, ne11)) {
+        ggml_cuda_mul_mat_ms(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {

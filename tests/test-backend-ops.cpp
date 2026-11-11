@@ -2524,6 +2524,119 @@ struct test_get_rows : public test_case {
     }
 };
 
+// The split head of MS models (llm_graph_context::build_split_head): two tables of different types,
+// the logits in stored row order, then permuted to vocab order (scatter for one output, gather otherwise).
+struct test_ms_split_head : public test_case {
+    const ggml_type type_hi;
+    const ggml_type type_lo;
+    const int64_t k;
+    const int64_t n_hi;
+    const int64_t n_lo;
+    const int64_t n;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_hi, type_lo, k, n_hi, n_lo, n);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MS_SPLIT_HEAD";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_ms_split_head(ggml_type type_hi = GGML_TYPE_MS_C6, ggml_type type_lo = GGML_TYPE_MS_C3,
+            int64_t k = 1024, int64_t n_hi = 1000, int64_t n_lo = 3000, int64_t n = 512)
+        : type_hi(type_hi), type_lo(type_lo), k(k), n_hi(n_hi), n_lo(n_lo), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w_hi = ggml_new_tensor_2d(ctx, type_hi, k, n_hi);
+        ggml_set_name(w_hi, "w_hi");
+        ggml_tensor * w_lo = ggml_new_tensor_2d(ctx, type_lo, k, n_lo);
+        ggml_set_name(w_lo, "w_lo");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * ord = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_hi + n_lo);
+        ggml_set_name(ord, "ord");
+        ggml_tensor * inv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_hi + n_lo);
+        ggml_set_name(inv, "inv");
+
+        ggml_tensor * st = ggml_concat(ctx, ggml_mul_mat(ctx, w_hi, x), ggml_mul_mat(ctx, w_lo, x), 0);
+        ggml_tensor * out;
+        if (n == 1) {
+            // stored row i goes to row ord[i]
+            ggml_tensor * d   = ggml_reshape_2d(ctx, ggml_dup(ctx, st), 1, st->ne[0]);
+            ggml_tensor * src = ggml_reshape_2d(ctx, st, 1, st->ne[0]);
+            out = ggml_cont_2d(ctx, ggml_set_rows(ctx, d, src, ord), st->ne[0], 1);
+        } else {
+            // row t is stored row inv[t]
+            out = ggml_cont(ctx, ggml_transpose(ctx, ggml_get_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, st)), inv)));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<int32_t> ord(n_hi + n_lo);
+        for (size_t i = 0; i < ord.size(); i++) {
+            ord[i] = (int32_t) i;
+        }
+        std::shuffle(ord.begin(), ord.end(), std::default_random_engine(1234));
+        std::vector<int32_t> inv(ord.size());
+        for (size_t i = 0; i < ord.size(); i++) {
+            inv[ord[i]] = (int32_t) i;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                const std::vector<int32_t> & v = strcmp(t->name, "ord") == 0 ? ord : inv;
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// MS_C mul_mat with activations far outside the f16 range (or tiny): the tensor core path must not overflow or flush
+struct test_ms_act_range : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const float s;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, s);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MS_ACT_RANGE";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_ms_act_range(ggml_type type_a = GGML_TYPE_MS_C4, int64_t m = 64, int64_t n = 64, int64_t k = 1024, float s = 1e5f)
+        : type_a(type_a), m(m), n(n), k(k), s(s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, ggml_scale(ctx, b, s));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS on a weight also used by GGML_OP_MUL_MAT (tied embeddings)
 // that the preceding mul_mat may have put in the SYCL reorder layout. The
 // mul_mat runs first, so a backend that changes the weight layout in place
@@ -11396,6 +11509,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 16, 1024, {3, 2}, {2, 2}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16,  1, 512, {2, 3}, {1, 1}, {0, 2, 1, 3}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 16, 512, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+        // batched tensor core path: n tile 64 and 128, row and column tails, 4 and 8 warps
+        for (int n : {9, 64, 65, 130, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, n, 1536, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000,  512, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5300,  512,  512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 20500,  33,  512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 64, 1024, {3, 2}, {2, 2}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 64,  512, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+    }
+    for (ggml_type type_a : {GGML_TYPE_MS_C2, GGML_TYPE_MS_C6}) {
+        for (int n : {1, 9, 64, 512}) {
+            for (float sc : {1e5f, 1e-6f}) {
+                test_cases.emplace_back(new test_ms_act_range(type_a, 200, n, 1024, sc));
+            }
+        }
+    }
+    for (auto types : std::vector<std::pair<ggml_type, ggml_type>>{
+            {GGML_TYPE_MS_C6, GGML_TYPE_MS_C3}, {GGML_TYPE_MS_C5, GGML_TYPE_MS_C1}, {GGML_TYPE_MS_C4, GGML_TYPE_MS_C2}}) {
+        for (int n : {1, 9, 512}) {
+            test_cases.emplace_back(new test_ms_split_head(types.first, types.second, 1024, 1000, 3000, n));
+        }
     }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
@@ -13057,6 +13192,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
+        }
+    }
+
+    // MS_C batched, shapes of Qwen3.5-2B, with K-quant rivals
+    for (ggml_type type_a : {GGML_TYPE_MS_C3, GGML_TYPE_MS_C5, GGML_TYPE_MS_C6, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int bs : {9, 16, 32, 64, 128, 256, 512, 1024, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6144, bs, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, bs, 6144, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, bs, 2048, {1, 1}, {1, 1}));
         }
     }
 
