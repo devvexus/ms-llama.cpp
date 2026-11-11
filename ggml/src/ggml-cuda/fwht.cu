@@ -7,6 +7,7 @@
 #define GGML_CUDA_FWHT_BLOCK_NT 256
 
 // fused: multiply src by row r % v_rows of v before the transform, and also write the result to dst_q8_1 if it is not null
+// (n_rows*N/QK8_1 q8_1 blocks, then as many block_y16 for the MS_C mat-vec)
 template <int N, typename T, bool fused>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale, const float * v, const int64_t v_rows,
@@ -73,10 +74,11 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
 
     if constexpr (fused) {
         if (dst_q8_1 != nullptr) {
+            block_y16 * y16 = (block_y16 *) (dst_q8_1 + n_rows * (N / QK8_1)) + r * (N / QK8_1);
             dst_q8_1 += r * (N / QK8_1);
 #pragma unroll
             for (int i = 0; i < el_w; ++i) {
-                quantize_q8_1_value(dst_q8_1 + (i * warp_size + lane) / QK8_1, lane % QK8_1, reg[i]);
+                quantize_q8_1_y16_value(dst_q8_1 + (i * warp_size + lane) / QK8_1, y16 + (i * warp_size + lane) / QK8_1, lane % QK8_1, reg[i]);
             }
         }
     }
@@ -171,10 +173,11 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
 
     if constexpr (fused) {
         if (dst_q8_1 != nullptr) {
+            block_y16 * y16 = (block_y16 *) (dst_q8_1 + n_rows * (N / QK8_1)) + r * (N / QK8_1);
             dst_q8_1 += r * (N / QK8_1);
 #pragma unroll
             for (int i = 0; i < NE; ++i) {
-                quantize_q8_1_value(dst_q8_1 + (i * NT + tid) / QK8_1, tid % QK8_1, reg[i]);
+                quantize_q8_1_y16_value(dst_q8_1 + (i * NT + tid) / QK8_1, y16 + (i * NT + tid) / QK8_1, tid % QK8_1, reg[i]);
             }
         }
     }

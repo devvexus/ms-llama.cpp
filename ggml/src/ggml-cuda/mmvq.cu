@@ -72,6 +72,24 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     }
 }
 
+
+// MS_C uses 16 bit activations: y16 are the block_y16 of the q8_1 blocks y
+template <ggml_type type>
+static __device__ __forceinline__ float mmvq_vec_dot(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y, const block_y16 * __restrict__ y16, const int & kbx, const int & iqs) {
+    if constexpr (type == GGML_TYPE_MS_C1) { GGML_UNUSED(y); return vec_dot_ms_c_y16<block_ms_c1>(vbq, y16, kbx, iqs); }
+    else if constexpr (type == GGML_TYPE_MS_C2) { GGML_UNUSED(y); return vec_dot_ms_c_y16<block_ms_c2>(vbq, y16, kbx, iqs); }
+    else if constexpr (type == GGML_TYPE_MS_C3) { GGML_UNUSED(y); return vec_dot_ms_c_y16<block_ms_c3>(vbq, y16, kbx, iqs); }
+    else if constexpr (type == GGML_TYPE_MS_C4) { GGML_UNUSED(y); return vec_dot_ms_c_y16<block_ms_c4>(vbq, y16, kbx, iqs); }
+    else if constexpr (type == GGML_TYPE_MS_C5) { GGML_UNUSED(y); return vec_dot_ms_c_y16<block_ms_c5>(vbq, y16, kbx, iqs); }
+    else if constexpr (type == GGML_TYPE_MS_C6) { GGML_UNUSED(y); return vec_dot_ms_c_y16<block_ms_c6>(vbq, y16, kbx, iqs); }
+    else {
+        GGML_UNUSED(y16);
+        constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+        return vec_dot_q_cuda(vbq, y, kbx, iqs);
+    }
+}
+
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
@@ -676,7 +694,10 @@ static __global__ void mul_mat_vec_q(
     constexpr int  nwarps_k        = warp_rows ? 1 : nwarps;
     static_assert(!warp_rows || (rows_per_cuda_block >= nwarps && rows_per_cuda_block % nwarps == 0), "warp_rows needs whole rows per warp");
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    const block_y16 * y16_base = (const block_y16 *) ((const block_q8_1 *) vy + fusion.y_res);
+    auto vec_dot_q_cuda = [&](const void * vbq, const block_q8_1 * bq8_1, const int kbx, const int iqs) {
+        return mmvq_vec_dot<type>(vbq, bq8_1, y16_base + (bq8_1 - (const block_q8_1 *) vy), kbx, iqs);
+    };
 
     const     int tid = warp_rows ? threadIdx.x : warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x + (warp_rows ? rows_per_thread*threadIdx.y : 0);
@@ -934,7 +955,10 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    const block_y16 * y16_base = (const block_y16 *) ((const block_q8_1 *) vy + fusion.y_res);
+    auto vec_dot_q_cuda = [&](const void * vbq, const block_q8_1 * bq8_1, const int kbx, const int iqs) {
+        return mmvq_vec_dot<type>(vbq, bq8_1, y16_base + (bq8_1 - (const block_q8_1 *) vy), kbx, iqs);
+    };
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
@@ -1637,14 +1661,18 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    // MS_C reads 16 bit activations: block_y16 after the q8_1 blocks (also in the cache of the fused rotation)
+    const bool    y_has_res   = ggml_cuda_type_is_ms_c(src0->type);
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t nblocks_y   = ne13*ne12 * ne11*ne10_padded / QK8_1;
+    fusion_local.y_res = y_has_res ? nblocks_y : 0;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const void * src1_q8_1_d = ggml_cuda_mul_mat_vec_q_cached_src1(ctx, src1);
     if (src1_q8_1_d == nullptr) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        src1_q8_1_d = src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        src1_q8_1_d = src1_q8_1.alloc(nblocks_y * (sizeof(block_q8_1) + (y_has_res ? sizeof(block_y16) : 0)));
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 

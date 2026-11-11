@@ -50,11 +50,12 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+template <bool res>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2, const int64_t y_res) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
@@ -83,7 +84,12 @@ static __global__ void quantize_q8_1(
     ggml_cuda_pdl_sync();
     const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
 
-    quantize_q8_1_value(&y[ib], iqs, xi);
+    if constexpr (res) {
+        quantize_q8_1_y16_value(&y[ib], (block_y16 *) (y + y_res) + ib, iqs, xi);
+    } else {
+        quantize_q8_1_value(&y[ib], iqs, xi);
+        GGML_UNUSED(y_res);
+    }
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -553,8 +559,12 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
-    GGML_UNUSED(type_src0);
+    if (ggml_cuda_type_is_ms_c(type_src0)) {
+        const int64_t y_res = ne0*ne1*ne2*ne3/QK8_1;
+        ggml_cuda_kernel_launch(quantize_q8_1<true>,  launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, y_res);
+    } else {
+        ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, (int64_t) 0);
+    }
 }
 
 void quantize_mmq_q8_1_cuda(

@@ -4030,7 +4030,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         block_q8_1 * q8_1 = nullptr;
         if (ggml_nrows(node) <= MMVQ_MAX_BATCH_SIZE && node->ne[0] % MATRIX_ROW_PADDING == 0 &&
             cuda_ctx->stream_context().concurrent_events.empty()) {
-            cuda_ctx->q8_1_cache = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), ggml_nelements(mm)/QK8_1*sizeof(block_q8_1));
+            // q8_1 blocks, then block_y16 for the MS_C mat-vecs
+            cuda_ctx->q8_1_cache = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),
+                ggml_nelements(mm)/QK8_1*(sizeof(block_q8_1) + sizeof(block_y16)));
             q8_1 = (block_q8_1 *) cuda_ctx->q8_1_cache->get();
         }
 

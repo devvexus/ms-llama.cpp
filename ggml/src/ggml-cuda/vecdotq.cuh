@@ -1525,3 +1525,42 @@ static __device__ __forceinline__ float vec_dot_ms_c_q8_1(
 
     return __half2float(bq->d) * __low2float(bq8->ds) * sumi;
 }
+
+// as vec_dot_ms_c_q8_1 with 16 bit activations: 32 weights (iqs = 0..15) of an MS_C block times block_y16 iqs.
+// v*y with v = (sum of the bytes of x) - 510 is below 2^24 in magnitude, the sum of 32 of them fits int32.
+template <typename block_t>
+static __device__ __forceinline__ float vec_dot_ms_c_y16(
+    const void * __restrict__ vbq, const block_y16 * __restrict__ by16, const int & kbx, const int & iqs) {
+
+    constexpr int k = 8*sizeof(block_t::qs)/QK_MS; // bits per weight
+
+    const block_t   * bq = (const block_t *) vbq + kbx;
+    const block_y16 * by = by16 + iqs;
+
+    // code bits MSB first, the window of state j starts at bit 18 + k*j
+    uint32_t w[k + 1];
+    w[0] = iqs == 0 ? bq->s0 : ms_c_bswap(get_int_b4(bq->qs, k*iqs - 1));
+#pragma unroll
+    for (int i = 0; i < k; ++i) {
+        w[i + 1] = ms_c_bswap(get_int_b4(bq->qs, k*iqs + i));
+    }
+
+    int q[QK8_1/2];
+#pragma unroll
+    for (int i = 0; i < QK8_1/2; ++i) {
+        q[i] = get_int_b4(by->qs, i);
+    }
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int      b  = 18 + k*j;
+        const uint64_t ww = ((uint64_t) w[b/32] << 32) | w[min(b/32 + 1, k)];
+        const uint32_t s  = (ww >> (50 - b%32)) & GGML_MS_STATE_MASK;
+        const int      v  = ms_c_dp4a(GGML_MS_C_A*s + GGML_MS_C_B, 0x01010101, ms_c_dp4a_bias);
+        const int      y  = j % 2 == 0 ? (int) (int16_t) (q[j/2] & 0xFFFF) : q[j/2] >> 16;
+        sumi += v*y;
+    }
+
+    return __half2float(bq->d) * by->d * sumi;
+}
