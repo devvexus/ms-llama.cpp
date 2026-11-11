@@ -1,14 +1,38 @@
-# ms-llama.cpp: llama.cpp with MS (Mad Shift) quantization
+# ms-llama.cpp
 
-This fork adds **MS (Mad Shift)**, a GGUF weight format created by **Matthew Priester**
-([GitHub](https://github.com/devvexus), [ORCID](https://orcid.org/0009-0000-0032-5292)). At the same file size, MS files stay
-much closer to the original model than standard K-/I-quants and unsloth's dynamic quants.
-Format, decoding and credits: [docs/ms.md](docs/ms.md) · Models: [huggingface.co/devvexus](https://huggingface.co/devvexus) ·
-Copyright and license: [NOTICE](NOTICE).
+## What's ms-llama.cpp?
 
-The original llama.cpp README follows.
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that runs **MS (Mad Shift)** quantized models. Everything else works
+exactly like llama.cpp: the same tools (`llama-cli`, `llama-server`, `llama-bench`, ...), the same GGUF models, CPU and CUDA.
+
+## What's MS (Mad Shift)?
+
+MS is a new GGUF quantization format created by **Matthew Priester** ([GitHub](https://github.com/devvexus),
+[ORCID](https://orcid.org/0009-0000-0032-5292)). **At the same file size, MS models stay far closer to the original model than
+standard quants and unsloth's dynamic quants**: on Qwen3.5-2B, every MS file has 4-9x lower KL divergence to the original BF16
+model than the unsloth file of the same or larger size.
+
+- **How:** every large weight matrix is stored as a bitshift-trellis code (the code of QTIP, Tseng et al. 2024) after a random
+  Hadamard rotation, produced by MS's own calibration-aware conversion. Details: [docs/ms.md](docs/ms.md).
+- **Models:** [huggingface.co/devvexus](https://huggingface.co/devvexus) ("MS Quants" collection).
+- **Credit and license:** [NOTICE](NOTICE). MS is MIT-licensed like llama.cpp; please credit *MS (Mad Shift) by Matthew Priester*.
+
+## Run an MS model
+
+```bash
+git clone https://github.com/devvexus/ms-llama.cpp
+cd ms-llama.cpp
+git checkout ms-split-head   # until the MS release branch is merged into master
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release   # CPU only: drop -DGGML_CUDA=ON
+cmake --build build --config Release -j
+./build/bin/llama-cli -m <MS model>.gguf -ngl 99
+```
+
+Stock llama.cpp, Ollama and LM Studio cannot load MS files yet.
 
 ---
+
+*The original llama.cpp README follows.*
 
 # llama.cpp
 
