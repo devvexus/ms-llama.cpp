@@ -430,7 +430,7 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_MS_C1   = 43,
+        GGML_TYPE_MS_C1   = 43, // MS (Mad Shift) types MS_C1..MS_C6, by Matthew Priester (see NOTICE)
         GGML_TYPE_MS_C2   = 44,
         GGML_TYPE_MS_C3   = 45,
         GGML_TYPE_MS_C4   = 46,

@@ -1,3 +1,15 @@
+# ms-llama.cpp: llama.cpp with MS (Mad Shift) quantization
+
+This fork adds **MS (Mad Shift)**, a GGUF weight format created by **Matthew Priester**
+([GitHub](https://github.com/devvexus), [ORCID](https://orcid.org/0009-0000-0032-5292)). At the same file size, MS files stay
+much closer to the original model than standard K-/I-quants and unsloth's dynamic quants.
+Format, decoding and credits: [docs/ms.md](docs/ms.md) · Models: [huggingface.co/devvexus](https://huggingface.co/devvexus) ·
+Copyright and license: [NOTICE](NOTICE).
+
+The original llama.cpp README follows.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

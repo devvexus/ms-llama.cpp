@@ -463,6 +463,7 @@ typedef struct {
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
 // MS_C: bit-shift trellis with a computed value per state, k = 1..6 bits per weight
+// MS (Mad Shift) by Matthew Priester (see NOTICE and docs/ms.md); trellis code after QTIP (arXiv:2406.11235)
 // state: s_0 = s0, s_i = ((s_{i-1} << k) | b_i) & GGML_MS_STATE_MASK, b_i = next k bits of qs (MSB first)
 // value: x = GGML_MS_C_A*s + GGML_MS_C_B (mod 2^32), w = ((sum of the 4 bytes of x) - 510) * d
 #define QK_MS 512

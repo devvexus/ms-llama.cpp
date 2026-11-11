@@ -1,0 +1,14 @@
+MS (Mad Shift) quantization for llama.cpp
+Copyright (c) 2026 Matthew Priester (https://github.com/devvexus, ORCID 0009-0000-0032-5292)
+
+This fork of llama.cpp adds the MS (Mad Shift) weight format, written by Matthew Priester:
+- the MS_C1..MS_C6 tensor types (bitshift-trellis code, k = 1..6 bits per weight, 512-weight blocks) and their CPU (x86, ARM)
+  and CUDA kernels;
+- the prism.hadamard input-rotation metadata and its handling in the graph;
+- split embedding tables and split output heads (msffn.emb_split_order, output_lo).
+
+The trellis code builds on QTIP (A. Tseng, Q. Sun, D. Hou, C. De Sa, "QTIP: Quantization with Trellises and Incoherence
+Processing", NeurIPS 2024, arXiv:2406.11235): the bitshift trellis and its computed "1MAD" decoder.
+
+The MS additions are distributed under the same MIT License as llama.cpp (see LICENSE). When you copy or adapt them, keep this
+notice and the copyright line above, as the MIT License requires.
