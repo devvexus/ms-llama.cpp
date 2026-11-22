@@ -1719,6 +1719,11 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// MUL_MAT_ID of MS_C experts decodes the rows once per chunk of columns (F32 activations)
+static bool ggml_cpu_mul_mat_id_ms_c_rows(const struct ggml_tensor * src0) {
+    return ggml_ms_c_bits(src0->type) > 0 && type_traits_cpu[src0->type].vec_dot_type == GGML_TYPE_F32;
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1733,7 +1738,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    float * rows_f32) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1746,6 +1752,35 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const int64_t blck_1 = 16;
 
     float tmp[16];
+
+    // MS_C (F32 vec_dot, which decodes the row for every column): with 2 or more columns, decode blck_0 rows once into
+    // rows_f32 and take F32 dot products for all columns of the chunk
+    if (rows_f32 != NULL && ir1_end - ir1_start >= 2) {
+        const int ms_c_bits = ggml_ms_c_bits(type);
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            const int64_t n0 = MIN(blck_0, ir0_end - iir0);
+            for (int64_t r = 0; r < n0; ++r) {
+                ggml_ms_c_to_f32(ms_c_bits, src0_cur + (iir0 + r)*nb01, rows_f32 + r*ne00, ne00);
+            }
+            for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+
+                const float * src1_col = (const float *) ((const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12)));
+
+                float * dst_col = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+
+                for (int64_t r = 0; r < n0; ++r) {
+                    ggml_vec_dot_f32(ne00, &dst_col[iir0 + r], 0, rows_f32 + r*ne00, 0, src1_col, 0, 1);
+                }
+            }
+        }
+        return;
+    }
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -1845,6 +1880,11 @@ static void ggml_compute_forward_mul_mat_id(
     // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
     // reservation is unconditional, the per expert eligibility is decided at dispatch time
     char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
+
+    // MS_C: 16 decoded rows per thread (see ggml_compute_forward_mul_mat_id_one_chunk)
+    const bool ms_c_rows = ggml_cpu_mul_mat_id_ms_c_rows(src0);
+    float * rows_f32 = ms_c_rows ?
+        (float *) incr_ptr_aligned(&wdata_cur, (size_t) nth*16*ne00*sizeof(float), CACHE_LINE_SIZE) + (size_t) ith*16*ne00 : NULL;
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -1970,7 +2010,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, rows_f32
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -3155,6 +3195,10 @@ struct ggml_cplan ggml_graph_plan(
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
+                        // MS_C decoded rows
+                        if (ggml_cpu_mul_mat_id_ms_c_rows(src0)) {
+                            cur += (size_t) n_tasks*16*src0->ne[0]*sizeof(float) + CACHE_LINE_SIZE;
+                        }
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
