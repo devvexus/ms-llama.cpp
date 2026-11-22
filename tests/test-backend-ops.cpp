@@ -12894,6 +12894,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // MS_C experts at the shapes of Qwen3.6-35B-A3B (n_embd 2048, expert FFN 512, 256 experts, top 8): gate/up (one input
+    // per token, broadcast to the experts) and down, one token, the mat-vec batches and prompt batches
+    for (ggml_type type_a : ms_c_types) {
+        for (int n : {1, 2, 5, 8, 9, 16, 32, 64, 128, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, true,  512,  n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+        // gate + up + SWIGLU, and down with the expert weights multiplied in
+        for (int n : {1, 4, 8, 32, 512}) {
+            test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_SWIGLU, n, 512, 2048,
+                true, 256, 8, true, false, true, false, {1, 1}));
+        }
+        for (int n : {1, 8, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n, 512, 1, true));
+        }
+        // the column tiles of the tensor core MUL_MAT_ID (16, 32, 64 and 128 pairs per expert on average), a partial row
+        // tile, experts strided in memory
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 4, b, 200, 100, 1024));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, b, 200, 200, 1024));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  8, 4, b, 200, 300, 1024));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 64, 33, 1536, 80));
+    }
+
     // Test IQP panel path for all grid IQ types
     for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS}) {
@@ -14519,6 +14544,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
+            }
+        }
+    }
+
+    // qwen3.6-35b-a3b experts (256 experts, top 8, n_embd 2048, expert FFN 512): MS_C against the K-quants of a Q4_K_M
+    for (int bs : {1, 2, 4, 8, 16, 32, 64, 128, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_MS_C3, GGML_TYPE_MS_C4, GGML_TYPE_MS_C5, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, true,  512,  bs, 2048)); // gate, up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));  // down
+            if (bs <= 8) {
+                test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_SWIGLU, bs, 512, 2048,
+                    true, 256, 8, true, false, true, false, {1, 1})); // gate + up + SWIGLU
             }
         }
     }

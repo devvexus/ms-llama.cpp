@@ -4,6 +4,7 @@
 //  - MUL_MAT with the weights in the CPU_REPACK buffer, where the build has MS_C paths there (int8 activations on ARM, int16
 //    activations on x86), against references of the same integer math
 //  - the same results with 1, 4 and all threads, and for two mat-vecs of one column in one graph
+//  - MUL_MAT_ID (MoE experts) with the weights in a CPU buffer
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -700,6 +701,86 @@ static void test_pairs(int k, ggml_backend_t be, ggml_backend_buffer_type_t buft
     printf("  pair with MS_C%d: %s\n", k2, n_fail == n_fail0 ? "same results as alone" : "FAILED");
 }
 
+// MUL_MAT_ID with experts of MS_C weights in a CPU buffer (MoE FFN): b with one column per token (gate, up) or one per used
+// expert (down), against ref_f32 of the selected expert for each (token, slot); the same results with 1, 4 and all threads
+static void test_mul_mat_id(int k, ggml_backend_t be) {
+    const int     n_exp  = 6;
+    const int     n_used = 3;
+    const int64_t M      = 40;
+    int64_t n_out = 0;
+    double worst = -1.0;
+
+    for (const int64_t K : { (int64_t) 512, (int64_t) 2048 }) {
+        std::vector<ms_weights> ws;
+        for (int e = 0; e < n_exp; e++) {
+            ws.push_back(make_weights(k, K, M, SCALE_MIXED));
+        }
+        for (const bool bcast : { true, false }) {
+            for (const int64_t N : { (int64_t) 1, (int64_t) 5, (int64_t) 17, (int64_t) 33 }) {
+                const int64_t ncols = bcast ? 1 : n_used;
+                const std::vector<float> x = make_x(K, ncols*N, 0);
+
+                // expert ids: n_used different experts per token, expert n_exp - 1 not used by any token of odd N
+                std::vector<int32_t> ids(n_used*N);
+                for (int64_t t = 0; t < N; t++) {
+                    for (int s = 0; s < n_used; s++) {
+                        ids[t*n_used + s] = (int32_t) ((t*7 + s*(N % 2 ? 1 : 2)) % (N % 2 ? n_exp - 1 : n_exp));
+                    }
+                }
+
+                const ggml_init_params ip = { 8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+                ggml_context * ctx_w = ggml_init(ip);
+                ggml_context * ctx   = ggml_init(ip);
+                ggml_tensor * W = ggml_new_tensor_3d(ctx_w, ms_type(k), K, M, n_exp);
+                ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, ggml_backend_cpu_buffer_type());
+                for (int e = 0; e < n_exp; e++) {
+                    ggml_backend_tensor_set(W, ws[e].data.data(), e*W->nb[2], ws[e].data.size());
+                }
+                ggml_tensor * X   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, ncols, N);
+                ggml_tensor * I   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, N);
+                ggml_tensor * out = ggml_mul_mat_id(ctx, W, X, I);
+                ggml_cgraph * gf  = ggml_new_graph(ctx);
+                ggml_build_forward_expand(gf, out);
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+                ggml_backend_tensor_set(X, x.data(), 0, ggml_nbytes(X));
+                ggml_backend_tensor_set(I, ids.data(), 0, ggml_nbytes(I));
+
+                std::vector<float> res[3];
+                for (int t = 0; t < 3; t++) {
+                    res[t].assign(ggml_nelements(out), NAN);
+                    ggml_backend_tensor_set(out, res[t].data(), 0, ggml_nbytes(out));
+                    ggml_backend_cpu_set_n_threads(be, nths[t]);
+                    CHECK(ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS, "graph compute failed");
+                    ggml_backend_tensor_get(out, res[t].data(), 0, ggml_nbytes(out));
+                }
+                CHECK(same(res[0], res[2]) && same(res[1], res[2]), "MS_C%d MUL_MAT_ID K=%lld N=%lld bcast=%d: thread counts differ",
+                      k, (long long) K, (long long) N, (int) bcast);
+
+                // dst [M, n_used, N]: column (s, t) is expert ids[t][s] times the b column (bcast ? t : t*n_used + s)
+                int64_t bad = 0;
+                for (int64_t t = 0; t < N; t++) {
+                    for (int s = 0; s < n_used; s++) {
+                        const int64_t c = bcast ? t : t*n_used + s;
+                        const std::vector<float> xc(x.begin() + c*K, x.begin() + (c + 1)*K);
+                        const expected e = ref_f32(ws[ids[t*n_used + s]], xc, 1, false);
+                        const std::vector<float> o(res[2].begin() + (t*n_used + s)*M, res[2].begin() + (t*n_used + s + 1)*M);
+                        bad += count_bad(o, e, worst);
+                    }
+                }
+                CHECK(bad == 0, "MS_C%d MUL_MAT_ID K=%lld N=%lld bcast=%d: %lld outputs differ from the reference",
+                      k, (long long) K, (long long) N, (int) bcast, (long long) bad);
+                n_out += M*n_used*N;
+
+                ggml_backend_buffer_free(buf);
+                ggml_backend_buffer_free(buf_w);
+                ggml_free(ctx);
+                ggml_free(ctx_w);
+            }
+        }
+    }
+    printf("  MUL_MAT_ID, CPU buffer: %lld outputs (largest error %.2g of the bound)\n", (long long) n_out, worst);
+}
+
 // the CPU_REPACK buffer logs each tensor at the debug level
 static void log_no_debug(ggml_log_level level, const char * text, void * user_data) {
     (void) user_data;
@@ -743,6 +824,7 @@ int main(void) {
         test_vec_dot(k);
         test_mul_mat(k, be, buft_repack);
         test_pairs(k, be, buft_repack);
+        test_mul_mat_id(k, be);
     }
 
     ggml_backend_free(be);
