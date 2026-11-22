@@ -1,5 +1,6 @@
 #include "mmms.cuh"
 #include "mmvq.cuh"
+#include "mmid.cuh"
 #include "unary.cuh"
 #include "cp-async.cuh"
 #include "graph.cuh"
@@ -366,6 +367,8 @@ struct mmms_args {
     int ne1; int ne11_pad; int ne12; int ne13; int r2; int r3;
     int64_t s1; int64_t s2; int64_t s3;
     int ntiles_m; int ntiles_n; int ntiles; int nblocks;
+    // MUL_MAT_ID: the column tiles of the experts (ntiles_n of them), the sorted (token, slot) pairs, y in src1 column order
+    const ggml_cuda_mm_id_tile_spec * tile_spec; const int32_t * ids_dst; int n_used; int ne11_src;
 };
 
 // first iteration of block b
@@ -383,10 +386,13 @@ static __device__ __forceinline__ int mmms_out_col(const int lane, const int j, 
 
 // glu: warps 0 .. nwarps/2 - 1 compute rows of the gate (a.x), the others the same rows of the up weights (a.x_up),
 // the tile is written as glu(gate, up); one block per tile (no stream-k), bm = 8*nwarps output rows
-template <int k, int nwarps, int bn, bool acc_f16, bool glu>
+// ids (MUL_MAT_ID): column tile tn is a.tile_spec[tn], up to bn sorted (token, slot) pairs of one expert; y holds the src1
+// columns in their own order, each pair reads its src1 column and writes its dst column; one block per tile (no stream-k)
+template <int k, int nwarps, int bn, bool acc_f16, bool glu, bool ids>
 static __device__ __forceinline__ void mul_mat_ms_c_body(
         const mmms_args & a, const char * __restrict__ xw, const int64_t s01, const int64_t s02, const int64_t s03) {
 #if defined(TURING_MMA_AVAILABLE)
+    static_assert(!(glu && ids), "no gate/up fusion for MUL_MAT_ID");
     using bl = mmms_block<k>;
     constexpr int bm      = glu ? 8*nwarps : 16*nwarps;
     constexpr int nthr    = nwarps*WARP_SIZE;
@@ -398,6 +404,10 @@ static __device__ __forceinline__ void mul_mat_ms_c_body(
 
     extern __shared__ half2 tile_y[];
     const unsigned int ty0 = (unsigned int) __cvta_generic_to_shared(tile_y);
+
+    // ids: the y column and the (token, slot) pair of each column of the tile, after the y stages
+    [[maybe_unused]] int * ids_ycol = (int *) ((char *) tile_y + MMMS_NSTAGES*sbytes);
+    [[maybe_unused]] int * ids_pair = ids_ycol + bn;
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -416,17 +426,34 @@ static __device__ __forceinline__ void mul_mat_ms_c_body(
         const int tile = it / nchunks;
         const int kc0  = it % nchunks;
         const int kc1  = min((int64_t) nchunks, kc0 + (it_end - it));
-        const int tn   = tile % a.ntiles_n;
-        const int tm   = (tile / a.ntiles_n) % a.ntiles_m;
-        const int iz   = tile / (a.ntiles_n*a.ntiles_m);
+        // ids: the row tiles of a column tile are neighbours (they read the same y columns)
+        const int tn   = ids ? tile / a.ntiles_m : tile % a.ntiles_n;
+        const int tm   = ids ? tile % a.ntiles_m : (tile / a.ntiles_n) % a.ntiles_m;
+        const int iz   = ids ? 0 : tile / (a.ntiles_n*a.ntiles_m);
         const int i12  = iz % a.ne12;
         const int i13  = iz / a.ne12;
 
-        const int col0 = tn*bn;
+        const int col0 = ids ? 0 : tn*bn;
         const int wr   = glu ? warp % (nwarps/2) : warp; // warp row
         const int row0 = tm*bm + 16*wr;
 
         const char * x0 = xw + (i13/a.r3)*s03 + (i12/a.r2)*s02;
+        [[maybe_unused]] int ncols = 0; // ids: pairs in the tile
+        if constexpr (ids) {
+            const ggml_cuda_mm_id_tile_spec ts = a.tile_spec[tn];
+            if (ts.col_low == ts.col_high) {
+                return; // one tile per block
+            }
+            ncols = ts.col_high - ts.col_low;
+            for (int j = tid; j < bn; j += nthr) {
+                const int pair = a.ids_dst[ts.col_low + min(j, ncols - 1)];
+                const int iex  = pair % a.n_used;
+                ids_ycol[j] = (pair / a.n_used)*a.ne11_src + iex % a.ne11_src;
+                ids_pair[j] = pair;
+            }
+            __syncthreads();
+            x0 = xw + (int64_t) ts.expert*s02;
+        }
         const char * xa = x0 + min(row0 + g + 0, a.ne01 - 1)*s01;
         const char * xb = x0 + min(row0 + g + 8, a.ne01 - 1)*s01;
 
@@ -439,8 +466,8 @@ static __device__ __forceinline__ void mul_mat_ms_c_body(
                 const int p    = i*nthr + tid;
                 const int col  = p / 8;
                 const int part = p % 8;
-                mmms_copy_16<(bn >= 64)>(dst_tile + (col*MMMS_SROW + 8*part)*sizeof(half),
-                    yz + (int64_t) col*(a.ne00/2) + kc*(MMMS_BK/2) + 4*part);
+                const half2 * yc = ids ? a.y + (int64_t) ids_ycol[col]*(a.ne00/2) : yz + (int64_t) col*(a.ne00/2);
+                mmms_copy_16<(bn >= 64)>(dst_tile + (col*MMMS_SROW + 8*part)*sizeof(half), yc + kc*(MMMS_BK/2) + 4*part);
             }
         };
 
@@ -584,6 +611,19 @@ static __device__ __forceinline__ void mul_mat_ms_c_body(
                     }
                 }
             }
+        } else if (ids) {
+#pragma unroll
+            for (int j = 0; j < ntn; ++j) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const int m = tm*bm + mmms_out_row(warp, lane, l);
+                    const int n = mmms_out_col(lane, j, l);
+                    if (m < a.ne01 && n < ncols) {
+                        const int pair = ids_pair[n];
+                        a.dst[(pair / a.n_used)*a.s2 + (pair % a.n_used)*a.s1 + m] = acc[j][l]*a.inv_scale[ids_ycol[n]];
+                    }
+                }
+            }
         } else if (kc0 == 0 && kc1 == nchunks) {
             float * dz = a.dst + i13*a.s3 + i12*a.s2;
 #pragma unroll
@@ -620,20 +660,20 @@ static __device__ __forceinline__ void mul_mat_ms_c_body(
 }
 
 // k_up: the type of the up weights with glu (the gate and up warps run the body of their own type, the barriers match)
-template <int k, int k_up, int nwarps, int bn, bool acc_f16, bool glu = false>
+template <int k, int k_up, int nwarps, int bn, bool acc_f16, bool glu = false, bool ids = false>
 static __global__ void __launch_bounds__(nwarps*WARP_SIZE)
 mul_mat_ms_c(const mmms_args a) {
     if constexpr (glu && k != k_up) {
         if (threadIdx.y >= nwarps/2) {
-            mul_mat_ms_c_body<k_up, nwarps, bn, acc_f16, glu>(a, a.x_up, a.s01_up, a.s02_up, a.s03_up);
+            mul_mat_ms_c_body<k_up, nwarps, bn, acc_f16, glu, false>(a, a.x_up, a.s01_up, a.s02_up, a.s03_up);
         } else {
-            mul_mat_ms_c_body<k,    nwarps, bn, acc_f16, glu>(a, a.x,    a.s01,    a.s02,    a.s03);
+            mul_mat_ms_c_body<k,    nwarps, bn, acc_f16, glu, false>(a, a.x,    a.s01,    a.s02,    a.s03);
         }
     } else if constexpr (glu) {
         const bool up = threadIdx.y >= nwarps/2;
-        mul_mat_ms_c_body<k, nwarps, bn, acc_f16, glu>(a, up ? a.x_up : a.x, up ? a.s01_up : a.s01, up ? a.s02_up : a.s02, up ? a.s03_up : a.s03);
+        mul_mat_ms_c_body<k, nwarps, bn, acc_f16, glu, false>(a, up ? a.x_up : a.x, up ? a.s01_up : a.s01, up ? a.s02_up : a.s02, up ? a.s03_up : a.s03);
     } else {
-        mul_mat_ms_c_body<k, nwarps, bn, acc_f16, glu>(a, a.x, a.s01, a.s02, a.s03);
+        mul_mat_ms_c_body<k, nwarps, bn, acc_f16, glu, ids>(a, a.x, a.s01, a.s02, a.s03);
     }
 }
 
@@ -1032,7 +1072,7 @@ static void ggml_cuda_mul_mat_ms_small(ggml_backend_cuda_context & ctx, const gg
     const size_t y_size    = (size_t) ne12*ne13*ne11*ne10*sizeof(half);
     const size_t y_alloc   = y_size + (size_t) ne12*ne13*ne11*sizeof(float);
     const bool   use_cache = cache_ok && ctx.stream_context().concurrent_events.empty();
-    const bool   cached    = use_cache && ctx.mmms_y_src == src1 && ctx.mmms_y;
+    const bool   cached    = use_cache && ctx.mmms_y_src == src1 && !ctx.mmms_y_ids && ctx.mmms_y;
     ggml_cuda_pool_alloc<char> y_tmp(ctx.pool());
     char * yb;
     if (cached) {
@@ -1041,6 +1081,7 @@ static void ggml_cuda_mul_mat_ms_small(ggml_backend_cuda_context & ctx, const gg
         ctx.mmms_y.reset();
         ctx.mmms_y     = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), y_alloc);
         ctx.mmms_y_src = src1;
+        ctx.mmms_y_ids = false;
         yb = ctx.mmms_y->get();
     } else {
         yb = y_tmp.alloc(y_alloc);
@@ -1089,11 +1130,12 @@ bool ggml_cuda_should_use_mmms(enum ggml_type type, int cc, int64_t ne11) {
     return !disabled && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && (ne11 > MMVQ_MAX_BATCH_SIZE || small);
 }
 
-template <int k, int nwarps, int bn, bool acc_f16, bool glu = false, int k_up = k>
+template <int k, int nwarps, int bn, bool acc_f16, bool glu = false, int k_up = k, bool ids = false>
 static void mul_mat_ms_c_launch(ggml_backend_cuda_context & ctx, mmms_args a, const bool stream_k) {
     cudaStream_t stream = ctx.stream();
-    constexpr size_t nbytes_shared = mmms_nbytes_shared<bn>();
-    auto kernel = mul_mat_ms_c<k, k_up, nwarps, bn, acc_f16, glu>;
+    // ids: the columns of the tile after the y stages
+    constexpr size_t nbytes_shared = mmms_nbytes_shared<bn>() + (ids ? 2*bn*sizeof(int) : 0);
+    auto kernel = mul_mat_ms_c<k, k_up, nwarps, bn, acc_f16, glu, ids>;
     CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes_shared);
 
     const int id = ggml_cuda_get_device();
@@ -1213,6 +1255,33 @@ static bool mmms_use_f16_sums(const int id) {
     return choice[id] == 1;
 }
 
+// src1 as the f16 y of the tensor core kernel: column (i13*ne12 + i12)*ne11_pad + i11, zero columns from ne11 to ne11_pad
+static void mmms_convert_y_cuda(const ggml_tensor * src1, half2 * y, float * inv_scale, const int64_t ne11_pad, cudaStream_t stream) {
+    GGML_TENSOR_LOCALS(int64_t, ne1, src1, ne);
+    GGML_TENSOR_LOCALS(size_t,  nb1, src1, nb);
+
+    const int r1 = (ne10/8 + MMMS_CONVERT1_NT - 1)/MMMS_CONVERT1_NT;
+    const bool aligned = (uintptr_t) src1->data % 8 == 0 && nb11 % 8 == 0 && nb12 % 8 == 0 && nb13 % 8 == 0;
+    const dim3 grid(ne12*ne13*ne11_pad);
+#define MMMS_CONVERT1_CASE(r_) \
+    if (r1 == r_) { \
+        if (aligned) { mmms_convert_y1<true,  r_><<<grid, MMMS_CONVERT1_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale, \
+            ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float)); } \
+        else         { mmms_convert_y1<false, r_><<<grid, MMMS_CONVERT1_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale, \
+            ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float)); } \
+    } else
+    MMMS_CONVERT1_CASE(1) MMMS_CONVERT1_CASE(2) MMMS_CONVERT1_CASE(3) MMMS_CONVERT1_CASE(4) MMMS_CONVERT1_CASE(5) MMMS_CONVERT1_CASE(6)
+#undef MMMS_CONVERT1_CASE
+    if (aligned) {
+        mmms_convert_y<true><<<grid, MMMS_CONVERT_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale,
+            ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float));
+    } else {
+        mmms_convert_y<false><<<grid, MMMS_CONVERT_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale,
+            ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float));
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void ggml_cuda_mul_mat_ms_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src0_up,
         const ggml_tensor * src1, ggml_tensor * dst, const bool cache_ok, const int glu_op, const float glu_limit) {
     GGML_TENSOR_BINARY_OP_LOCALS;
@@ -1261,7 +1330,7 @@ static void ggml_cuda_mul_mat_ms_impl(ggml_backend_cuda_context & ctx, const ggm
     const size_t y_size    = (size_t) ne12*ne13*ne11_pad*ne10*sizeof(half);
     const size_t y_alloc   = y_size + (size_t) ne12*ne13*ne11_pad*sizeof(float);
     const bool   use_cache = cache_ok && ctx.stream_context().concurrent_events.empty();
-    const bool   cached    = use_cache && ctx.mmms_y_src == src1 && ctx.mmms_y;
+    const bool   cached    = use_cache && ctx.mmms_y_src == src1 && !ctx.mmms_y_ids && ctx.mmms_y;
     ggml_cuda_pool_alloc<char> y_tmp(ctx.pool());
     char * yb;
     if (cached) {
@@ -1270,33 +1339,15 @@ static void ggml_cuda_mul_mat_ms_impl(ggml_backend_cuda_context & ctx, const ggm
         ctx.mmms_y.reset();
         ctx.mmms_y     = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), y_alloc);
         ctx.mmms_y_src = src1;
+        ctx.mmms_y_ids = false;
         yb = ctx.mmms_y->get();
     } else {
         yb = y_tmp.alloc(y_alloc);
     }
     half2 * y         = (half2 *) yb;
     float * inv_scale = (float *) (yb + y_size);
-    const int r1 = (ne10/8 + MMMS_CONVERT1_NT - 1)/MMMS_CONVERT1_NT;
     if (!cached) {
-        const bool aligned = (uintptr_t) src1->data % 8 == 0 && nb11 % 8 == 0 && nb12 % 8 == 0 && nb13 % 8 == 0;
-        const dim3 grid(ne12*ne13*ne11_pad);
-#define MMMS_CONVERT1_CASE(r_) \
-        if (r1 == r_) { \
-            if (aligned) { mmms_convert_y1<true,  r_><<<grid, MMMS_CONVERT1_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale, \
-                ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float)); } \
-            else         { mmms_convert_y1<false, r_><<<grid, MMMS_CONVERT1_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale, \
-                ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float)); } \
-        } else
-        MMMS_CONVERT1_CASE(1) MMMS_CONVERT1_CASE(2) MMMS_CONVERT1_CASE(3) MMMS_CONVERT1_CASE(4) MMMS_CONVERT1_CASE(5) MMMS_CONVERT1_CASE(6)
-#undef MMMS_CONVERT1_CASE
-        if (aligned) {
-            mmms_convert_y<true><<<grid, MMMS_CONVERT_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale,
-                ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float));
-        } else {
-            mmms_convert_y<false><<<grid, MMMS_CONVERT_NT, 0, stream>>>((const float *) src1->data, (uint4 *) y, inv_scale,
-                ne10, ne11, ne11_pad, ne12, nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float));
-        }
-        CUDA_CHECK(cudaGetLastError());
+        mmms_convert_y_cuda(src1, y, inv_scale, ne11_pad, stream);
     }
 
     mmms_args a = {};
@@ -1341,6 +1392,117 @@ void ggml_cuda_mul_mat_ms(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     // op MUL_MAT (for their precision), but no sources, and it frees pool memory of its own after them
     const bool cache_ok = dst->op == GGML_OP_MUL_MAT && dst->src[0] == src0 && dst->src[1] == src1;
     ggml_cuda_mul_mat_ms_impl(ctx, src0, nullptr, src1, dst, cache_ok, -1, 0.0f);
+}
+
+bool ggml_cuda_should_use_mmms_id(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst, const int cc) {
+    if (!ggml_cuda_should_use_mmms(src0->type, cc, MMVQ_MAX_BATCH_SIZE + 1)) {
+        return false;
+    }
+    // one sample; rows of contiguous values; per token one src1 column, or one for each used expert; the limits of the ids helper
+    return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+        src0->ne[3] == 1 && src1->ne[3] == 1 && src0->ne[0] % QK_MS == 0 &&
+        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
+        ids->nb[0] == sizeof(int32_t) && (src1->ne[1] == 1 || src1->ne[1] == ids->ne[0]) &&
+        ids->ne[0] < (1 << 10) && src1->ne[2] < (1 << 22);
+}
+
+template <int k>
+static void mul_mat_ms_c_id_switch(ggml_backend_cuda_context & ctx, const int nwarps, const int bn, const bool acc_f16, const mmms_args & a) {
+#define MMMS_ID_CASE(nw_, bn_)                                                                              \
+    if (nwarps == nw_ && bn == bn_) {                                                                       \
+        if (acc_f16) { mul_mat_ms_c_launch<k, nw_, bn_, true,  false, k, true>(ctx, a, /*stream_k =*/ false); } \
+        else         { mul_mat_ms_c_launch<k, nw_, bn_, false, false, k, true>(ctx, a, /*stream_k =*/ false); } \
+        return;                                                                                             \
+    }
+    MMMS_ID_CASE(8, 128) MMMS_ID_CASE(8, 64) MMMS_ID_CASE(4, 32) MMMS_ID_CASE(4, 16)
+#undef MMMS_ID_CASE
+    GGML_ABORT("fatal error");
+}
+
+void ggml_cuda_mul_mat_ms_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type) && nb10 == sizeof(float) && nb0 == sizeof(float) && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(ne00 % QK_MS == 0 && ne00 == ne10);
+    GGML_ASSERT(ne03 == 1 && ne13 == 1);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int n_used  = ids->ne[0];
+    const int n_pairs = ne12*n_used;
+    GGML_ASSERT(ne1 == n_used && ne2 == ne12 && (ne11 == 1 || ne11 == n_used));
+
+    // column tile: the mean number of (token, slot) pairs per expert, rounded up to a tile width; GGML_CUDA_MMMS_ID_BN overrides
+    static const int bn_env = getenv("GGML_CUDA_MMMS_ID_BN") ? atoi(getenv("GGML_CUDA_MMMS_ID_BN")) : 0;
+    const int64_t mean   = (n_pairs + ne02 - 1)/ne02;
+    const int     bn     = bn_env == 16 || bn_env == 32 || bn_env == 64 || bn_env == 128 ? bn_env :
+                           mean <= 16 ? 16 : mean <= 32 ? 32 : mean <= 64 ? 64 : 128;
+    const int     nwarps = bn <= 32 ? 4 : 8;
+    const bool    acc_f16 = mmms_use_f16_sums(ggml_cuda_get_device());
+
+    // y: the src1 columns in their own order (a pair reads the column of its token and slot), kept for the next MUL_MAT_ID of
+    // this graph evaluation that reads src1 (gate and up); allocated before the index buffers, which are freed first
+    const int64_t ncols_y   = ne11*ne12;
+    const size_t  y_size    = (size_t) ncols_y*ne10*sizeof(half);
+    const size_t  y_alloc   = y_size + (size_t) ncols_y*sizeof(float);
+    const bool    use_cache = ctx.stream_context().concurrent_events.empty();
+    const bool    cached    = use_cache && ctx.mmms_y_src == src1 && ctx.mmms_y_ids && ctx.mmms_y;
+    ggml_cuda_pool_alloc<char> y_tmp(ctx.pool());
+    char * yb;
+    if (cached) {
+        yb = ctx.mmms_y->get();
+    } else if (use_cache) {
+        ctx.mmms_y.reset();
+        ctx.mmms_y     = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), y_alloc);
+        ctx.mmms_y_src = src1;
+        ctx.mmms_y_ids = true;
+        yb = ctx.mmms_y->get();
+    } else {
+        yb = y_tmp.alloc(y_alloc);
+    }
+    half2 * y         = (half2 *) yb;
+    float * inv_scale = (float *) (yb + y_size);
+    if (!cached) {
+        mmms_convert_y_cuda(src1, y, inv_scale, ne11, stream);
+    }
+
+    // the pairs sorted by expert, and the column tiles of each expert (empty tiles where negative ids leave seams unwritten)
+    const int ntj = (n_pairs + bn - 1)/bn + ne02;
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_pairs);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_pairs);
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), ntj);
+    CUDA_CHECK(cudaMemsetAsync(tile_spec.get(), 0, ntj*sizeof(ggml_cuda_mm_id_tile_spec), stream));
+    {
+        const int si1  = ids->nb[1] / sizeof(int32_t);
+        const int sis1 = nb12 / nb11;
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(),
+            ne02, ne12, n_used, ne11, bn, si1, sis1, /*write_inverse =*/ false, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    mmms_args a = {};
+    a.x = (const char *) src0->data; a.y = y; a.inv_scale = inv_scale; a.dst = (float *) dst->data; a.part = nullptr;
+    a.ne00 = ne00; a.ne01 = ne01; a.s01 = nb01; a.s02 = nb02; a.s03 = nb03;
+    a.ne1 = ne1; a.ne11_pad = ne11; a.ne12 = 1; a.ne13 = 1; a.r2 = 1; a.r3 = 1;
+    a.s1 = nb1/sizeof(float); a.s2 = nb2/sizeof(float); a.s3 = nb3/sizeof(float);
+    a.tile_spec = tile_spec.get(); a.ids_dst = ids_dst.get(); a.n_used = n_used; a.ne11_src = ne11;
+    a.ntiles_m = (ne01 + 16*nwarps - 1)/(16*nwarps);
+    a.ntiles_n = ntj;
+    a.ntiles   = a.ntiles_m*ntj;
+
+    switch (src0->type) {
+        case GGML_TYPE_MS_C1: mul_mat_ms_c_id_switch<1>(ctx, nwarps, bn, acc_f16, a); break;
+        case GGML_TYPE_MS_C2: mul_mat_ms_c_id_switch<2>(ctx, nwarps, bn, acc_f16, a); break;
+        case GGML_TYPE_MS_C3: mul_mat_ms_c_id_switch<3>(ctx, nwarps, bn, acc_f16, a); break;
+        case GGML_TYPE_MS_C4: mul_mat_ms_c_id_switch<4>(ctx, nwarps, bn, acc_f16, a); break;
+        case GGML_TYPE_MS_C5: mul_mat_ms_c_id_switch<5>(ctx, nwarps, bn, acc_f16, a); break;
+        case GGML_TYPE_MS_C6: mul_mat_ms_c_id_switch<6>(ctx, nwarps, bn, acc_f16, a); break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 bool ggml_cuda_should_fuse_mul_mat_ms(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, const int cc) {

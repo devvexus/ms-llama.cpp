@@ -1546,6 +1546,7 @@ struct ggml_backend_cuda_context {
     // allocated after q8_1_cache and freed before it
     const ggml_tensor * mmms_y_src = nullptr;
     std::unique_ptr<ggml_cuda_pool_alloc<char>> mmms_y;
+    bool mmms_y_ids = false; // the layout of the MUL_MAT_ID path (src1 columns not padded)
 
     void q8_1_cache_reset() {
         mmms_y_src = nullptr;

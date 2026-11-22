@@ -2643,6 +2643,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
+    if (ggml_cuda_should_use_mmms_id(src0, src1, dst->src[2], dst, cc)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -2687,6 +2691,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         if (use_mmq_few) {
             ggml_cuda_mul_mat_q_few(ctx, src0, src1, ids, dst);
+            return;
+        }
+
+        // MS_C experts, the batches after MMVQ
+        if (ggml_cuda_should_use_mmms_id(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mul_mat_ms_id(ctx, src0, src1, ids, dst);
             return;
         }
 
