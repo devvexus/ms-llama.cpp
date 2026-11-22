@@ -1,6 +1,9 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+#include <cstring>
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -40,15 +43,78 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a split token embedding holds the first n_hi stored rows in token_embd and the other rows in token_embd_lo
+    // a split head (untied output) holds the first stored rows in output and the other rows in output_lo
+    // both use the stored order msffn.emb_split_order (as in qwen35)
+    const auto * w_tok_lo = ml.get_weight(tn(LLM_TENSOR_TOKEN_EMBD_LO, "weight").str().c_str());
+    const auto * w_out_lo = ml.get_weight(tn(LLM_TENSOR_OUTPUT_LO,     "weight").str().c_str());
+    const bool has_mtp = hparams.n_layer_nextn > 0 && !(mtp_flags & (TENSOR_SKIP | TENSOR_NOT_REQUIRED));
+    if (w_tok_lo || w_out_lo) {
+        std::vector<int32_t> order;
+        ml.get_arr(LLM_KV_MSFFN_EMB_SPLIT_ORDER, order);
+        if ((int64_t) order.size() != n_vocab) {
+            throw std::runtime_error("msffn.emb_split_order needs one entry per token");
+        }
+        std::vector<bool> seen(n_vocab, false);
+        for (const int32_t id : order) {
+            if (id < 0 || id >= n_vocab || seen[id]) {
+                throw std::runtime_error("msffn.emb_split_order is not a permutation of the vocabulary");
+            }
+            seen[id] = true;
+        }
+        emb_split.order = std::move(order);
+    }
+
+    int64_t n_vocab_hi = n_vocab;
+    if (w_tok_lo) {
+        const int64_t n_lo = w_tok_lo->tensor->ne[1];
+        if (n_lo <= 0 || n_lo >= n_vocab) {
+            throw std::runtime_error("token_embd_lo.weight: bad number of rows");
+        }
+        if (has_mtp) {
+            throw std::runtime_error("a split token embedding does not support the MTP block");
+        }
+        n_vocab_hi = n_vocab - n_lo;
+        emb_split.n_hi = n_vocab_hi;
+        emb_split.n_lo = n_lo;
+    }
+
+    int64_t n_output_hi = n_vocab;
+    if (w_out_lo) {
+        const int64_t n_lo = w_out_lo->tensor->ne[1];
+        if (n_lo <= 0 || n_lo >= n_vocab) {
+            throw std::runtime_error("output_lo.weight: bad number of rows");
+        }
+        n_output_hi = n_vocab - n_lo;
+    }
+
+    // an MTP-only file may hold just the block: it then uses the token embedding and output head of the target model
+    const int io_flags = (trunk_flags & TENSOR_NOT_REQUIRED) ? TENSOR_NOT_REQUIRED : 0;
+
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_hi }, io_flags);
+    if (emb_split.n_hi) {
+        emb_split.tok_lo = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_LO, "weight"), { n_embd, emb_split.n_lo }, 0);
+    }
 
     // output
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, io_flags);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_output_hi }, TENSOR_NOT_REQUIRED);
+    if (emb_split.n_hi && output) {
+        throw std::runtime_error("a split token embedding needs a tied output");
+    }
+    if (w_out_lo) {
+        if (!output) {
+            throw std::runtime_error("output_lo.weight needs output.weight");
+        }
+        emb_split.out_lo = create_tensor(tn(LLM_TENSOR_OUTPUT_LO, "weight"), { n_embd, n_vocab - n_output_hi }, 0);
+    }
 
-    // if output is NULL, init from the input tok embed
-    if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+    // if output is NULL, init from the input tok embed (a block-only MTP file has neither)
+    if (output == NULL && tok_embd != NULL) {
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_hi }, TENSOR_DUPLICATED);
+        if (emb_split.n_hi) {
+            emb_split.out_lo = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_LO, "weight"), { n_embd, emb_split.n_lo }, TENSOR_DUPLICATED);
+        }
     }
 
     auto load_block_trunk = [&](int il, int flags) {
@@ -162,7 +228,7 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = build_inp_embd(model.tok_embd, 1.0f, &model.emb_split);
 
     cb(inpL, "model.input_embed", -1);
 
@@ -237,7 +303,11 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
     res->t_embd = cur;
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (model.emb_split.out_lo) {
+        cur = build_split_head(model.output, model.emb_split, cur);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -537,6 +607,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     GGML_ASSERT(layer.nextn.hnorm      && "MTP block missing nextn.hnorm");
     GGML_ASSERT(layer.ffn_gate_inp     && "MTP block missing ffn_gate_inp");
 
+    if (!model.tok_embd || !model.output) {
+        // e.g. a memory estimate of the file alone, before llama_model_borrow_io
+        throw std::runtime_error("a block-only MTP file needs the token embedding and output head of a target model (llama_model_borrow_io)");
+    }
+
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
 
@@ -554,6 +629,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+
+        // a Hadamard-latent table stores rotated rows; restore the primal basis (as in qwen35)
+        if (hdmd) {
+            if (const auto it = hdmd->inv.find(tok_embd_w); it != hdmd->inv.end()) {
+                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
+                if (it->second.signs) {
+                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
+                }
+            }
+        }
     } else {
         tok_embd = inp->embd;
     }
@@ -698,7 +783,14 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (!layer.nextn.shared_head_head && model.emb_split.out_lo) {
+        // the target's split head, as in the main graph; drafts come from its high rows (the most used tokens) only, which
+        // is faster for about the same acceptance; LLAMA_MTP_HEAD=full drafts from all rows
+        static const bool head_hi = [] { const char * e = getenv("LLAMA_MTP_HEAD"); return e == nullptr || strcmp(e, "full") != 0; }();
+        cur = build_split_head(model.output, model.emb_split, cur, head_hi);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
