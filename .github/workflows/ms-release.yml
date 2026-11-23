@@ -401,7 +401,7 @@ jobs:
       contents: write
 
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.MS_RELEASE_TOKEN }}  # fine-grained PAT (Contents RW, this repo): the job token gets HTTP 403 on POST /releases
       TAG: ${{ needs.tag.outputs.name }}
       SHA: ${{ needs.tag.outputs.sha }}
 

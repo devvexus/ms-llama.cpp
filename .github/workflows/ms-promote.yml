@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.MS_RELEASE_TOKEN }}  # fine-grained PAT (Contents RW, this repo): the job token gets HTTP 403 on POST /releases
 
     steps:
       - name: Clone

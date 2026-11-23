@@ -49,3 +49,6 @@ Follow a run with `gh run watch -R devvexus/ms-llama.cpp`; check the result with
   ids (201..206) at load time; new MS files are written with the Gen 2 ids. Nothing to do for users.
 - Upstream's own release workflows (`release.yml`, `release-publish.yml`, `make-release.yml`) only run in ggml-org/llama.cpp.
 - To withdraw a release: `gh release delete ms-v1.1 -R devvexus/ms-llama.cpp --cleanup-tag` (asks first).
+- Publishing uses the repository secret `MS_RELEASE_TOKEN`: a fine-grained personal access token (owner devvexus, only this
+  repository, Contents: read and write). The job's own token gets HTTP 403 on `POST /releases`. The secret was added on
+  2026-11-22 with a 1-year expiry: when GitHub warns that it expires, make a new token the same way and replace the secret.
