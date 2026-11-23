@@ -1,0 +1,34 @@
+ms-llama.cpp release packages: third-party components
+
+Which of the files below a package contains depends on the package (Windows, Linux or macOS; CPU or CUDA).
+
+1. ms-llama.cpp (llama.cpp, ggml): MIT License, see LICENSE. MS (Mad Shift) additions:
+   Copyright (c) 2026 Matthew Priester, see NOTICE.
+
+2. NVIDIA CUDA runtime and cuBLAS (CUDA packages only): cudart64_*.dll, cublas64_*.dll and cublasLt64_*.dll on Windows;
+   libcudart.so.13, libcublas.so.13 and libcublasLt.so.13 on Linux. They come from the NVIDIA CUDA Toolkit: 12.4 for
+   Windows x64, 13.5 for the other CUDA packages.
+   Copyright (c) NVIDIA Corporation. These files are NOT covered by the MIT License. They are redistributed under the
+   NVIDIA CUDA Toolkit End User License Agreement (https://docs.nvidia.com/cuda/eula/index.html) for use only with this
+   application.
+
+3. LLVM OpenMP runtime (libomp.dll, Windows packages). Apache License 2.0 with LLVM Exceptions, see LICENSE-LLVM-OpenMP.
+   Redistributed unmodified.
+
+4. Microsoft Visual C++ Runtime (msvcp140*.dll, vcruntime140*.dll, Windows packages).
+   Copyright (c) Microsoft Corporation. These files are NOT covered by the MIT License. They are redistributed unmodified
+   as Visual Studio Distributable Code under the Microsoft Software License Terms for Visual Studio.
+
+5. Built into the programs:
+   - cpp-httplib, MIT License, Copyright (c) 2017 yhirose (licenses/cpp-httplib-LICENSE)
+   - nlohmann/json, MIT License, Copyright (c) 2013-2025 Niels Lohmann (licenses/LICENSE-jsonhpp)
+   - rotate-bits, MIT License, Copyright (c) 2021 William Casarin (licenses/rotate-bits-LICENSE.md)
+   - stb_image (Sean Barrett), public domain / MIT
+   - miniaudio (David Reid), public domain / MIT-0
+   - subprocess.h (Neil Henning), public domain (Unlicense)
+   - BoringSSL, Apache License 2.0 (licenses/boringssl-LICENSE)
+   - xxHash, BSD 2-Clause License, Copyright (c) 2012-2021 Yann Collet (licenses/xxhash-LICENSE)
+   - sha1 (Steve Reid) and sha256 (Igor Pavlov), public domain
+   - the JavaScript libraries of the llama-server web UI: their own permissive licenses (licenses/webui-THIRD-PARTY.txt)
+
+This project is not affiliated with or endorsed by NVIDIA, Microsoft, Qwen/Alibaba Cloud or unsloth.

@@ -16,6 +16,11 @@ on:
         required: false
         default: ''
         type: string
+      dry_run:
+        description: 'Build and pack only: upload the release files as a workflow artifact, publish nothing'
+        required: false
+        default: false
+        type: boolean
   push:
     branches:
       - master
@@ -136,7 +141,14 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          Copy-Item LICENSE, NOTICE .\build\bin\Release\
+          Copy-Item LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt .\build\bin\Release\
+          Copy-Item -Recurse licenses .\build\bin\Release\licenses
+          # the Microsoft C++ runtime (Visual Studio Distributable Code), so the programs start on a clean Windows install
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\${{ matrix.arch }}\Microsoft.VC*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
+          if (-not $crt) { throw "no MSVC C++ runtime redist found for ${{ matrix.arch }} under $vs" }
+          Copy-Item "$($crt.FullName)\msvcp140*.dll", "$($crt.FullName)\vcruntime140*.dll" .\build\bin\Release\
+          Get-ChildItem .\build\bin\Release\msvcp140*.dll, .\build\bin\Release\vcruntime140*.dll | ForEach-Object { $_.Name }
           7z a -snl ms-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
@@ -262,7 +274,7 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          cp LICENSE NOTICE ./build/bin/
+          cp LICENSE NOTICE THIRD-PARTY-NOTICES.txt ./build/bin/ && cp -r licenses ./build/bin/
           tar -czvf ms-llama-linux-${{ matrix.build }}-cpu.tar.gz --transform "s,^\.,ms-llama," -C ./build/bin .
 
       - name: Upload artifacts
@@ -333,7 +345,7 @@ jobs:
 
       - name: Pack artifacts (with the CUDA runtime libraries)
         run: |
-          cp LICENSE NOTICE ./build/bin/
+          cp LICENSE NOTICE THIRD-PARTY-NOTICES.txt ./build/bin/ && cp -r licenses ./build/bin/
           cp -L /usr/local/cuda/lib64/libcudart.so.13 /usr/local/cuda/lib64/libcublas.so.13 /usr/local/cuda/lib64/libcublasLt.so.13 ./build/bin/
           tar -czvf ms-llama-linux-${{ matrix.build }}-cuda13.tar.gz --transform "s,^\.,ms-llama," -C ./build/bin .
 
@@ -383,7 +395,7 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          cp LICENSE NOTICE ./build/bin/
+          cp LICENSE NOTICE THIRD-PARTY-NOTICES.txt ./build/bin/ && cp -r licenses ./build/bin/
           tar -czvf ms-llama-macos-${{ matrix.build }}.tar.gz -s ",^\.,ms-llama," -C ./build/bin .
 
       - name: Upload artifacts
@@ -437,7 +449,15 @@ jobs:
           cp artifact/ms-llama-*.tar.gz "$R/"
           ls -l "$R"
 
+      - name: Upload the release files (dry run)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ms-release-dry-run
+          path: release/*
+
       - name: Publish the pre-release
+        if: ${{ !inputs.dry_run }}
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
@@ -464,5 +484,5 @@ jobs:
           fi
 
       - name: Promote to a full release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' && !inputs.dry_run }}
         run: bash scripts/ms-release-promote.sh "${{ inputs.version }}" "$TAG"

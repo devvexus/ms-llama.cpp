@@ -52,3 +52,7 @@ Follow a run with `gh run watch -R devvexus/ms-llama.cpp`; check the result with
 - Publishing uses the repository secret `MS_RELEASE_TOKEN`: a fine-grained personal access token (owner devvexus, only this
   repository, Contents: read and write). The job's own token gets HTTP 403 on `POST /releases`. The secret was added on
   2026-11-22 with a 1-year expiry: when GitHub warns that it expires, make a new token the same way and replace the secret.
+- Test the packaging without publishing anything: `gh workflow run ms-release.yml -R devvexus/ms-llama.cpp --ref <branch> -f dry_run=true`
+  builds every package and uploads the release files as the workflow artifact `ms-release-dry-run`.
+- Every package carries LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt and `licenses/`; the Windows packages also carry the Microsoft
+  C++ runtime (msvcp140*.dll, vcruntime140*.dll) and libomp.dll with LICENSE-LLVM-OpenMP.
